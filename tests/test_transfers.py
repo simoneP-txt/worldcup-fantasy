@@ -62,14 +62,16 @@ def test_unlimited_window_is_full_rebuild(current_team):
     assert {101, 102, 103} <= set(plan.solution.squad_ids)
 
 
-def test_paid_transfer_taken_when_gain_beats_penalty(current_team):
-    # 3 huge upgrades vs 2 free transfers: worth paying for the third
+def test_caps_at_free_allowance_no_voluntary_paid(current_team):
+    # 3 huge upgrades available, but only 2 free transfers: the user never
+    # pays a voluntary -3, so advise takes exactly 2 and leaves the third
+    # (the Wildcard is the route for a bigger rebuild)
     pool = _pool(star_ep=12.0)
     plan = plan_transfers(pool, current_team, budget=100.0, next_round=2)
     assert plan.free_allowance == 2
-    assert len(plan.in_ids) == 3
-    assert plan.n_paid == 1
-    assert plan.penalty_points == rules.EXTRA_TRANSFER_PENALTY
+    assert len(plan.in_ids) == 2
+    assert plan.n_paid == 0
+    assert plan.penalty_points == 0.0
 
 
 def test_no_paid_transfer_for_marginal_gains(current_team):

@@ -150,7 +150,13 @@ def availability_factors(
     raw = _get("/injuries", INJURIES_CACHE, league=WORLD_CUP_LEAGUE_ID, season=SEASON)
     if not raw:
         last_run_info["flagged"] = 0
-        last_run_info["source"] = "off (no API_FOOTBALL_KEY)" if api_key() is None else "no data"
+        # Distinguish a missing key from a key that returned nothing: the
+        # free API-Football plan has no access to season 2026, so a valid
+        # key still yields an empty response there.
+        last_run_info["source"] = (
+            "no API_FOOTBALL_KEY" if api_key() is None
+            else "key set, no 2026 data (free plan)"
+        )
         return {}
     factors = build_injury_factors(raw, squads, players)
     last_run_info["flagged"] = len(factors)

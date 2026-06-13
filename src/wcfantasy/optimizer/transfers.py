@@ -2,11 +2,16 @@
 
 The allocation is stage-dependent (rules.FREE_TRANSFERS_BY_ROUND), plus
 an optional carryover in the group stage. Unlimited windows (the R32)
-re-solve the squad from scratch. Beyond the free allocation, each extra
-transfer costs 3 points: an extra change is accepted only if its
-marginal ILP objective gain beats the penalty (the objective is in
-expected-points units, so the comparison is apples to apples up to the
-bench/horizon weighting).
+re-solve the squad from scratch.
+
+User strategy: never spend a voluntary -3 paid transfer. The plan stays
+within the free allowance, and the Wildcard is the escape hatch for a
+big rebuild (played only in an extraordinary, clearly-worth-it case).
+The single exception is being FORCED past the allowance: when more
+current players are unplayable (eliminated/transferred) than the
+allowance can shed, those moves are unavoidable, so the planner takes
+the minimum number that yields a valid squad and the report flags them
+and points to the Wildcard.
 """
 
 from dataclasses import dataclass, field
@@ -17,10 +22,10 @@ from .. import rules
 from ..state import TeamState
 from .squad import SquadSolution, build_squad
 
-# Never evaluate more than this many paid transfers beyond the free
-# allocation: each one must individually beat the 3-point penalty, and
-# in practice the marginal gain collapses after one or two.
-MAX_PAID_TRANSFERS = 3
+# How far past the free allowance the planner will search for FORCED
+# moves (unplayable players) before giving up and rebuilding from
+# scratch. Never used to take a voluntary paid transfer.
+MAX_FORCED_TRANSFERS = 4
 
 
 @dataclass
@@ -58,15 +63,16 @@ def plan_transfers(
         solution = build_squad(players, budget=budget, max_per_squad=max_per_squad)
         return _diff(state, solution, allowance=None, next_round=next_round)
 
+    # Stay within the free allowance: no voluntary paid transfer. Walk
+    # max_changes up only when the keep-constraint is INFEASIBLE, i.e. more
+    # current players are unplayable (eliminated/transferred -> ep_match 0,
+    # dropped from the pool) than the allowance can shed. The first feasible
+    # level is the answer: the free allowance normally, or the minimum number
+    # forced by unplayable players. We never go past it for a mere EP gain.
     best = None
-    # Walk up from the free allocation. A level is infeasible when more
-    # current players are unplayable (eliminated team -> ep_match 0, dropped
-    # from the pool) than that many changes allow: those are forced moves,
-    # so keep raising max_changes until a squad exists instead of crashing.
-    # Beyond the allocation each extra change must beat the 3-point penalty.
-    for changes in range(allowance, allowance + 1 + MAX_PAID_TRANSFERS):
+    for changes in range(allowance, allowance + 1 + MAX_FORCED_TRANSFERS):
         try:
-            cand = build_squad(
+            best = build_squad(
                 players,
                 budget=budget,
                 keep_ids=state.player_ids,
@@ -75,15 +81,11 @@ def plan_transfers(
             )
         except RuntimeError:
             continue  # too few changes to shed unplayable players
-        if best is None:
-            best = cand
-        elif cand.objective - best.objective > rules.EXTRA_TRANSFER_PENALTY:
-            best = cand
-        else:
-            break
+        break
     if best is None:
-        # Even the deepest paid level cannot keep enough of the squad (many
-        # teams out): a free full rebuild is the only valid plan left.
+        # Even the deepest level cannot keep enough of the squad (many teams
+        # out): a free full rebuild is the only valid plan left (a Wildcard
+        # round in practice).
         best = build_squad(players, budget=budget, max_per_squad=max_per_squad)
     return _diff(state, best, allowance=allowance, next_round=next_round)
 

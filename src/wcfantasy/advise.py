@@ -164,10 +164,11 @@ def run() -> None:
         else "club stats: OFF (price prior; run with soccerdata installed)"
     )
     avail_info = availability.last_run_info
+    avail_source = avail_info.get("source", "?")
     avail_note = (
-        f"availability: {avail_info.get('flagged', 0)} flagged ({avail_info.get('source', '?')})"
-        if avail_info.get("source", "").startswith("api")
-        else "availability: OFF (no API_FOOTBALL_KEY)"
+        f"availability: {avail_info.get('flagged', 0)} flagged ({avail_source})"
+        if avail_source.startswith("api")
+        else f"availability: OFF ({avail_source})"
     )
     cal_note = (
         "calibration: ON (data/state/calibration.json)"
@@ -214,8 +215,10 @@ def run() -> None:
             )
         if plan.n_paid:
             moves.append(
-                f"WARNING: {plan.n_paid} transfer(s) beyond the allocation, "
-                f"-{plan.penalty_points:.0f} pts at lockout (worth it per the model)."
+                f"FORCED: {plan.n_paid} transfer(s) beyond the free "
+                f"{plan.free_allowance}, -{plan.penalty_points:.0f} pts at lockout. "
+                "Caused by unplayable players, not a voluntary upgrade: if the gain "
+                "is clearly worth it, play the Wildcard instead of paying the penalty."
             )
         if plan.carried_next:
             moves.append(
