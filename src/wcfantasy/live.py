@@ -1,0 +1,465 @@
+"""Intra-round advisor: captain switches and manual substitutions.
+
+`python -m wcfantasy live`, run any time while a round is being played,
+answers two questions with expected-value arithmetic:
+
+- my captain has completed his match with X points: is there an
+  unlocked starter whose expected points beat X? (switching moves the
+  double from a known X to an expected value);
+- a starter has completed his match with X points: is there an unlocked
+  bench player expected to beat X? (manual sub, formation permitting).
+
+Both must price in the official catch: the FIRST manual change of a
+round (sub or captain/vice change) cancels automatic DNP substitutions
+AND the vice-captain insurance for that round. After the first change
+that cost is sunk and further changes are free.
+
+Live-feed schema verified at matchday 1 (2026-06-12): match status is
+'complete' / 'scheduled' (round status 'playing' while live), and
+stats.roundPoints is a dict keyed by round number as string, e.g.
+{'1': 13}. The defensive fallbacks below stay as insurance.
+"""
+
+from datetime import datetime, timedelta, timezone
+
+from rich.console import Console
+
+from . import feed_status, features, fifa_client, rules, state
+from .data_sources import availability as availability_mod
+from .models import player_points
+
+console = Console()
+
+# Rough chance that a starter whose match is still to play ends up with
+# no minutes (late knock, surprise rotation). Used only to price the
+# auto-sub insurance forfeited by the first manual change.
+DNP_PROB = 0.06
+
+
+def _rome_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/Rome")
+    except Exception:
+        # No tz database: the tournament (June-July 2026) is all CEST.
+        return timezone(timedelta(hours=2), "CEST")
+
+
+def _rome(when: datetime) -> datetime:
+    return when.astimezone(_rome_tz())
+
+
+# ------------------------------------------------------------ feed parsing
+
+def match_phase(match: dict) -> str:
+    """'scheduled' | 'live' | 'completed' (defensive on status values)."""
+    status = str(match.get("status") or "scheduled").lower()
+    if status in feed_status.DONE:
+        return "completed"
+    if status in feed_status.LIVE:
+        return "live"
+    if match.get("homeScore") is not None and status not in ("scheduled", "postponed"):
+        # has a score but an unknown status: assume in progress
+        return "live"
+    return "scheduled"
+
+
+def current_live_round(rounds: list[dict]) -> dict | None:
+    """The round being played now: some matches started, some still to go.
+
+    Returns None between rounds (nothing started, or everything done).
+    """
+    for rnd in sorted(rounds, key=lambda r: r["id"]):
+        phases = [match_phase(m) for m in rnd.get("tournaments", [])]
+        if not phases:
+            continue
+        if any(p == "live" for p in phases):
+            return rnd
+        if any(p == "completed" for p in phases) and any(p == "scheduled" for p in phases):
+            return rnd
+    return None
+
+
+def squad_phases(rnd: dict) -> dict[int, str]:
+    """squadId -> phase of its match in this round."""
+    out: dict[int, str] = {}
+    for m in rnd.get("tournaments", []):
+        phase = match_phase(m)
+        for key in ("homeSquadId", "awaySquadId"):
+            if m.get(key) is not None:
+                out[m[key]] = phase
+    return out
+
+
+def round_kickoffs(rnd: dict) -> dict[int, datetime]:
+    """squadId -> kickoff time of its match in this round."""
+    out: dict[int, datetime] = {}
+    for m in rnd.get("tournaments", []):
+        try:
+            when = datetime.fromisoformat(str(m.get("date")))
+        except (TypeError, ValueError):
+            continue
+        for key in ("homeSquadId", "awaySquadId"):
+            if m.get(key) is not None:
+                out[m[key]] = when
+    return out
+
+
+def _deadline(kickoffs: dict[int, datetime] | None, squad_id: int) -> str:
+    """' Act before his kickoff (...)' - every live suggestion expires
+    the moment the incoming player's match starts (he becomes locked).
+    Time shown in Italian local time."""
+    when = (kickoffs or {}).get(squad_id)
+    return f" Act before his kickoff ({_rome(when):%d %b %H:%M}, IT)." if when else ""
+
+
+def player_round_points(stats: dict | None, round_no: int) -> float | None:
+    """Points scored in `round_no`, or None if the feed does not say.
+
+    The real schema (verified matchday 1) is a dict keyed by the round
+    number as a string: {'1': 13}. The list fallbacks below are kept as
+    insurance against mid-tournament schema changes.
+    """
+    rp = (stats or {}).get("roundPoints")
+    if rp is None:
+        return None
+    if isinstance(rp, dict):
+        for key in (str(round_no), round_no):
+            if key in rp:
+                value = rp[key]
+                if isinstance(value, (int, float)):
+                    return float(value)
+                if isinstance(value, dict):
+                    return _points_value(value)
+        return None
+    if isinstance(rp, list):
+        for item in rp:
+            if isinstance(item, dict):
+                rid = item.get("round") or item.get("roundId") or item.get("id")
+                if rid == round_no:
+                    return _points_value(item)
+        if rp and all(isinstance(x, (int, float)) for x in rp) and len(rp) >= round_no:
+            return float(rp[round_no - 1])
+    return None
+
+
+def _points_value(item: dict) -> float | None:
+    for key in ("points", "score", "value", "totalPoints"):
+        if isinstance(item.get(key), (int, float)):
+            return float(item[key])
+    return None
+
+
+# ------------------------------------------------------------ pure logic
+
+def formation_valid_after_swap(
+    starter_positions: list[str], out_pos: str, in_pos: str
+) -> bool:
+    """Would the XI still match an official formation after the swap?"""
+    if (out_pos == "GK") != (in_pos == "GK"):
+        return False  # GK can only be replaced by the backup GK
+    if out_pos == in_pos:
+        return True
+    counts = {pos: starter_positions.count(pos) for pos in ("DEF", "MID", "FWD")}
+    counts[out_pos] -= 1
+    counts[in_pos] += 1
+    return (counts["DEF"], counts["MID"], counts["FWD"]) in rules.FORMATIONS
+
+
+def first_change_cost(team: state.TeamState, df, phases: dict[int, str]) -> float:
+    """EV forfeited by the FIRST manual change: the auto-sub insurance.
+
+    Every starter still to play might DNP; with auto-subs alive each DNP
+    would be patched from the bench for free at round end.
+    """
+    by_id = df.set_index("id")
+    pending = [
+        pid for pid in team.starters
+        if pid in by_id.index
+        and phases.get(int(by_id.loc[pid, "squadId"]), "scheduled") != "completed"
+    ]
+    bench = [
+        pid for pid in (*team.bench_order, team.bench_gk_id)
+        if pid in by_id.index
+        and phases.get(int(by_id.loc[pid, "squadId"]), "scheduled") == "scheduled"
+    ]
+    if not pending or not bench:
+        return 0.0
+    bench_ep = float(by_id.loc[list(bench), "ep_match"].mean())
+    return len(pending) * DNP_PROB * bench_ep
+
+
+def captain_advice(
+    df,
+    team: state.TeamState,
+    phases: dict[int, str],
+    points: dict[int, float | None],
+    change_cost: float,
+    kickoffs: dict[int, datetime] | None = None,
+) -> list[str]:
+    by_id = df.set_index("id")
+    if team.captain_id not in by_id.index:
+        return ["Captain not found in the player feed: check your saved team."]
+    cap = by_id.loc[team.captain_id]
+    cap_phase = phases.get(int(cap["squadId"]), "scheduled")
+
+    if cap_phase == "scheduled":
+        return [f"Captain {cap['name']} has not played yet: nothing to do."]
+    if cap_phase == "live":
+        return [
+            f"Captain {cap['name']} is playing now (locked): re-run after "
+            "his match to evaluate a switch."
+        ]
+
+    actual = points.get(team.captain_id)
+    candidates = by_id.loc[
+        [
+            pid for pid in team.starters
+            if pid != team.captain_id
+            and pid in by_id.index
+            and phases.get(int(by_id.loc[pid, "squadId"]), "scheduled") == "scheduled"
+        ]
+    ]
+    if candidates.empty:
+        return [
+            f"Captain {cap['name']} has finished, but no starter is still "
+            "to play: no switch possible."
+        ]
+    best = candidates.sort_values("ep_match", ascending=False).iloc[0]
+
+    deadline = _deadline(kickoffs, int(best["squadId"]))
+    if actual is None:
+        return [
+            f"Captain {cap['name']} has finished but his live points are "
+            "not in the feed yet. Rule of thumb: switch to "
+            f"{best['name']} (expected {best['ep_match']:.1f}) only if the "
+            f"captain scored fewer than ~{best['ep_match'] + change_cost:.1f} pts."
+            + deadline
+        ]
+
+    gain = float(best["ep_match"]) - actual - change_cost
+    if gain > 0:
+        msg = (
+            f"SWITCH captain to {best['name']} ({best['squadName']}): the "
+            f"double moves from {actual:.0f} banked pts to an expected "
+            f"{best['ep_match']:.1f} (net gain ~{gain:+.1f}"
+        )
+        if change_cost > 0:
+            msg += f" after pricing the auto-sub forfeit ~{change_cost:.1f}"
+        return [msg + ")." + deadline]
+    return [
+        f"KEEP captain {cap['name']}: his {actual:.0f} banked pts beat "
+        f"{best['name']}'s expected {best['ep_match']:.1f}"
+        + (f" once the auto-sub forfeit (~{change_cost:.1f}) is priced in"
+           if change_cost > 0 else "")
+        + "."
+    ]
+
+
+def substitution_advice(
+    df,
+    team: state.TeamState,
+    phases: dict[int, str],
+    points: dict[int, float | None],
+    change_cost: float,
+    kickoffs: dict[int, datetime] | None = None,
+) -> list[str]:
+    by_id = df.set_index("id")
+    starters = [pid for pid in team.starters if pid in by_id.index]
+    bench_ids = [
+        pid for pid in (*team.bench_order, team.bench_gk_id)
+        if pid is not None and pid in by_id.index
+    ]
+    starter_positions = [str(by_id.loc[pid, "position"]) for pid in starters]
+
+    advice: list[str] = []
+    first_change_pending = change_cost > 0
+    for pid in starters:
+        row = by_id.loc[pid]
+        if phases.get(int(row["squadId"]), "scheduled") != "completed":
+            continue
+        actual = points.get(pid)
+        candidates = [
+            bid for bid in bench_ids
+            if phases.get(int(by_id.loc[bid, "squadId"]), "scheduled") == "scheduled"
+            and formation_valid_after_swap(
+                starter_positions, str(row["position"]), str(by_id.loc[bid, "position"])
+            )
+        ]
+        if not candidates:
+            continue
+        best_id = max(candidates, key=lambda b: float(by_id.loc[b, "ep_match"]))
+        best = by_id.loc[best_id]
+        deadline = _deadline(kickoffs, int(best["squadId"]))
+
+        if actual is None:
+            advice.append(
+                f"{row['name']} has finished (points unknown in feed): bench "
+                f"option is {best['name']} expected {best['ep_match']:.1f}."
+                + deadline
+            )
+            continue
+        if actual == 0:
+            # Likely DNP (any appearance is worth at least 1 point).
+            if first_change_pending:
+                advice.append(
+                    f"{row['name']} likely DNP (0 pts): if you make NO other "
+                    "manual change, the round-end auto-sub fixes this for "
+                    f"free; sub {best['name']} in manually only if you prefer "
+                    "him over your bench priority order."
+                )
+            else:
+                advice.append(
+                    f"SUB {row['name']} (likely DNP, 0 pts) -> {best['name']} "
+                    f"(expected {best['ep_match']:.1f}): auto-subs are already "
+                    "off, the manual sub is free upside." + deadline
+                )
+            continue
+        gain = float(best["ep_match"]) - actual - change_cost
+        if gain > 0:
+            advice.append(
+                f"SUB {row['name']} ({actual:.0f} pts banked) -> {best['name']} "
+                f"(expected {best['ep_match']:.1f}, net ~{gain:+.1f})."
+                + deadline
+            )
+    return advice
+
+
+def round_outlook(
+    df,
+    team: state.TeamState,
+    phases: dict[int, str],
+    availability: dict[int, float] | None,
+    kickoffs: dict[int, datetime] | None = None,
+) -> list[str]:
+    """One line per MY player whose match is still to come this round:
+    how likely he is to take the pitch (P plays = depth chart x
+    availability). Expected points are decided elsewhere (lineup,
+    transfers, the captain/sub advice above): here we only flag who might
+    not play."""
+    by_id = df.set_index("id")
+    p_play = player_points.starter_probability(df, availability)
+    p_play.index = df["id"]
+
+    rows = []
+    for pid in team.player_ids:
+        if pid not in by_id.index:
+            continue
+        squad_id = int(by_id.loc[pid, "squadId"])
+        if phases.get(squad_id, "scheduled") != "scheduled":
+            continue  # already played or playing now
+        when = (kickoffs or {}).get(squad_id)
+        rows.append((when, pid))
+
+    rows.sort(key=lambda r: r[0] or datetime.max.replace(tzinfo=timezone.utc))
+    lines = []
+    for when, pid in rows:
+        row = by_id.loc[pid]
+        role = "XI" if pid in team.starters else "bench"
+        stamp = f"{_rome(when):%a %H:%M}  " if when else ""
+        lines.append(
+            f"{stamp}{row['name']} ({row['squadName']}, {role}): "
+            f"{p_play[pid] * 100:.0f}% to play"
+        )
+    return lines
+
+
+def lineup_set_for_future_round(team_round_no: int, live_round_no: int) -> bool:
+    """True when my_team.json was applied for a round AFTER the one being
+    played now, so the saved XI is next round's plan, not what is actually
+    on the pitch (the apply/live footgun on round-transition days)."""
+    return bool(team_round_no) and team_round_no > live_round_no
+
+
+# ------------------------------------------------------------ orchestrator
+
+def run(mark_changed: bool = False) -> None:
+    console.print("[bold]Refreshing FIFA feeds...[/bold]")
+    fifa_client.refresh()
+    player_points.apply_calibration()
+    players_raw = fifa_client.load("players")
+    rounds = fifa_client.load("rounds")
+    squads = fifa_client.load("squads")
+
+    team = state.load()
+    if not team.player_ids:
+        console.print("No saved team: run `advise` then `team apply` first.")
+        return
+
+    rnd = current_live_round(rounds)
+    if rnd is None:
+        console.print(
+            "No round is live right now: between rounds, run `advise` instead."
+        )
+        return
+    round_no = rnd["id"]
+    console.print(f"Live round: [bold]{round_no}[/bold]")
+
+    if lineup_set_for_future_round(team.round_no, round_no):
+        console.print(
+            f"[bold yellow]Warning:[/bold yellow] your saved team is set for "
+            f"round {team.round_no}, but round {round_no} is live now. The XI "
+            "below may be next round's plan, not what is on the pitch. On "
+            "transition days run `live` BEFORE `team apply`, and apply the next "
+            "round only after this one is over.\n"
+        )
+
+    if mark_changed:
+        team.manual_changes_round = round_no
+        state.save(team)
+        console.print(
+            "Recorded: manual change made this round (auto-subs and vice "
+            "insurance are off from now on)."
+        )
+
+    phases = squad_phases(rnd)
+    kickoffs = round_kickoffs(rnd)
+    df = features.player_table(players_raw, squads)
+    # Injury / availability discount so a player ruled out is never
+    # offered as a sub or captain target. Confirmed lineups (published
+    # ~1h before kickoff) override the injuries feed when available.
+    injuries = availability_mod.availability_factors(squads, df)
+    lineups = availability_mod.live_lineup_factors(rnd, squads, df)
+    availability = {**injuries, **lineups}
+    # Same EP basis as advise: blend in the club-stats prior, not the
+    # price prior alone, so a borderline captain/sub call matches.
+    club_ep = player_points.club_prior(df)
+    df["ep_match"] = player_points.expected_points_per_match(
+        df, club_ep, availability=availability
+    )
+    points = {
+        p["id"]: player_round_points(p.get("stats"), round_no) for p in players_raw
+    }
+
+    changed_already = team.manual_changes_round == round_no
+    cost = 0.0 if changed_already else first_change_cost(team, df, phases)
+    if changed_already:
+        console.print(
+            "Manual change already made this round: auto-subs and vice "
+            "insurance are gone, further changes carry no hidden cost.\n"
+        )
+    else:
+        console.print(
+            "No manual change yet this round: the first one cancels "
+            f"auto-subs and the vice insurance (priced at ~{cost:.1f} pts "
+            "in the advice below).\n"
+        )
+
+    console.print("[bold]Captain:[/bold]")
+    for line in captain_advice(df, team, phases, points, cost, kickoffs):
+        console.print(f"  - {line}")
+
+    console.print("\n[bold]Substitutions:[/bold]")
+    subs = substitution_advice(df, team, phases, points, cost, kickoffs)
+    for line in subs or ["No substitution worth making right now."]:
+        console.print(f"  - {line}")
+
+    outlook = round_outlook(df, team, phases, availability, kickoffs)
+    console.print("\n[bold]Still to play this round (P plays):[/bold]")
+    for line in outlook or ["All your players have already played this round."]:
+        console.print(f"  - {line}")
+
+    console.print(
+        "\nIf you execute any change in the game, re-run with: "
+        "[bold]python -m wcfantasy live --mark-changed[/bold]"
+    )

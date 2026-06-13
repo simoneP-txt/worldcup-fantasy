@@ -1,0 +1,10 @@
+requests>=2.31
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+pulp>=2.8
+rich>=13.7
+pytest>=8.0
+# Optional: 25/26 club season stats prior (FBref). Everything degrades
+# to the price heuristic when missing.
+soccerdata>=1.8

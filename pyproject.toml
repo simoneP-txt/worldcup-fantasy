@@ -1,0 +1,28 @@
+[project]
+name = "wcfantasy"
+version = "0.1.0"
+description = "FIFA Fantasy World Cup 2026 advisor"
+requires-python = ">=3.11"
+# Runtime dependencies (mirrored in requirements.txt for the documented
+# `pip install -e . -r requirements.txt` workflow). soccerdata is the
+# optional club-stats prior: everything degrades to the price heuristic
+# without it, so it lives in the `club` extra.
+dependencies = [
+    "requests>=2.31",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "pulp>=2.8",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+club = ["soccerdata>=1.8"]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
