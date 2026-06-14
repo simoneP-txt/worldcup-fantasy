@@ -14,7 +14,7 @@ from pathlib import Path
 
 import requests
 
-from .config import FEEDS, FIFA_JSON_BASE, HTTP_HEADERS, RAW_DIR
+from .config import FEEDS, FIFA_DATA_API_BASE, FIFA_JSON_BASE, HTTP_HEADERS, RAW_DIR
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +27,25 @@ def _fetch(feed: str) -> bytes:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=20)
         if resp.status_code == 200:
             return resp.content
+        log.warning("GET %s -> %s (attempt %d)", url, resp.status_code, attempt + 1)
+        time.sleep(2**attempt)
+    resp.raise_for_status()
+    raise RuntimeError(f"unreachable: {url}")
+
+
+def fifa_api_get(path: str, **params) -> dict | list:
+    """GET an api.fifa.com/api/v3 endpoint (the official Match Centre feed).
+
+    Same browser-UA, retry policy as the fantasy feeds, but returns parsed
+    JSON. Raises on failure so optional callers (availability) can wrap it
+    and degrade cleanly to {}. `path` is appended to FIFA_DATA_API_BASE
+    and must start with '/'.
+    """
+    url = f"{FIFA_DATA_API_BASE}{path}"
+    for attempt in range(3):
+        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()
         log.warning("GET %s -> %s (attempt %d)", url, resp.status_code, attempt + 1)
         time.sleep(2**attempt)
     resp.raise_for_status()

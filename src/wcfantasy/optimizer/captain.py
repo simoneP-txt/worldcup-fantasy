@@ -113,6 +113,57 @@ def twelfth_man_pick(df: pd.DataFrame, solution: SquadSolution) -> pd.Series:
     return outside.sort_values("ep_match", ascending=False).iloc[0]
 
 
+def _progressing_starters(starters: pd.DataFrame, next_round: int) -> int:
+    """Starters favoured to progress to the next knockout round.
+
+    future_rounds is the sum of P(still playing) from next_round on; a value
+    above the rounds left AFTER this one means the team is favoured to go
+    through (so the Qualification +2 is likely to land).
+    """
+    threshold = 8 - next_round + 0.5
+    return int((starters["future_rounds"] > threshold).sum())
+
+
+def _dead_wood(squad: pd.DataFrame) -> pd.DataFrame:
+    """Squad players whose team is eliminated or all but out (Wildcard fuel)."""
+    return squad[
+        squad["isEliminated"].fillna(False) | (squad["future_rounds"] < 0.5)
+    ]
+
+
+def planned_activation(
+    unused: list[str],
+    next_round: int,
+    cap: pd.Series,
+    starters: pd.DataFrame,
+    squad: pd.DataFrame,
+) -> str | None:
+    """The SINGLE booster to ACTIVATE this round, by the user's strategy
+    priority, or None.
+
+    Decided up front so a lower-priority booster (Maximum Captain) can never
+    preempt a higher-priority planned one (Qualification at the semi-final):
+    that ordering bug is exactly what this guards against. Priority:
+    Qualification at the SF -> a late-KO Wildcard rebuild -> Maximum Captain.
+    """
+    if (
+        "qualification" in unused
+        and next_round == 7
+        and _progressing_starters(starters, next_round) >= 6
+    ):
+        return "qualification"
+    if (
+        "wildcard" in unused
+        and next_round >= 5
+        and next_round not in rules.WILDCARD_EXCLUDED_ROUNDS
+        and len(_dead_wood(squad)) >= 4
+    ):
+        return "wildcard"
+    if "maximum_captain" in unused and cap["ep_match"] >= 5.5:
+        return "maximum_captain"
+    return None
+
+
 def booster_advice(
     df: pd.DataFrame, state: TeamState, solution: SquadSolution, next_round: int
 ) -> list[str]:
@@ -130,37 +181,41 @@ def booster_advice(
     squad = df[df["id"].isin(solution.squad_ids)]
     cap = df.loc[df["id"] == solution.captain_id].iloc[0]
 
-    # Never two boosters in the same round: at most one ACTIVATE.
-    # Everything except the Wildcard can be deactivated before lockout,
-    # so an ACTIVATE here is risk-free until the round locks.
-    activated = False
+    # Never two boosters in the same round: pick the one to ACTIVATE up
+    # front by strategy priority; everyone else gets HOLD/info messaging.
+    # Everything except the Wildcard can be deactivated before lockout, so
+    # an ACTIVATE here is risk-free until the round locks.
+    planned = planned_activation(unused, next_round, cap, starters, squad)
 
-    if "maximum_captain" in unused and cap["ep_match"] >= 5.5:
-        advice.append(
-            f"ACTIVATE Maximum Captain: high-ceiling round ({cap['name']} "
-            f"expected {cap['ep_match']:.1f} pts) and the booster captains "
-            "your best XI scorer in hindsight, never worse than picking one."
-        )
-        activated = True
+    if "maximum_captain" in unused:
+        if planned == "maximum_captain":
+            advice.append(
+                f"ACTIVATE Maximum Captain: high-ceiling round ({cap['name']} "
+                f"expected {cap['ep_match']:.1f} pts) and the booster captains "
+                "your best XI scorer in hindsight, never worse than picking one."
+            )
+        elif cap["ep_match"] >= 5.5:
+            advice.append(
+                f"Maximum Captain candidate ({cap['name']} expected "
+                f"{cap['ep_match']:.1f} pts), but a higher-priority booster is "
+                "planned this round."
+            )
 
     if "qualification" in unused and next_round in rules.QUALIFICATION_BOOSTER_ROUNDS:
         # +2 per starter (>=1 minute played) whose team progresses; the
-        # captain's +2 is not doubled. future_rounds > rounds left after
-        # this one means the team is favoured to go through.
-        threshold = 8 - next_round + 0.5
-        progressing = (starters["future_rounds"] > threshold).sum()
+        # captain's +2 is not doubled.
+        progressing = _progressing_starters(starters, next_round)
         msg = (
             f"Qualification Booster: {progressing}/11 starters favoured to "
             "progress (+2 each, needs 1+ minute; captain's +2 not doubled)."
         )
-        if next_round == 7 and not activated and progressing >= 6:
+        if planned == "qualification":
             # User strategy: fire it at the SF, when the 6-per-country cap
             # lets the squad stack a likely finalist.
             advice.append(
                 "ACTIVATE " + msg + " Semi-final is your planned window: "
                 "starters from a finalist bank the bonus twice (SF + final win)."
             )
-            activated = True
         elif next_round < 7:
             advice.append(
                 "HOLD Qualification Booster (your plan: semi-finals). " + msg
@@ -175,16 +230,13 @@ def booster_advice(
                 "and the R32; the R32 window is unlimited anyway)."
             )
         elif next_round >= 5:
-            dead = squad[
-                squad["isEliminated"].fillna(False) | (squad["future_rounds"] < 0.5)
-            ]
-            if len(dead) >= 4 and not activated:
+            dead = _dead_wood(squad)
+            if planned == "wildcard":
                 advice.append(
                     f"ACTIVATE Wildcard (your plan): {len(dead)} squad players "
                     "are eliminated or done; rebuild around the teams still "
                     "alive. Careful: irreversible once confirmed."
                 )
-                activated = True
             elif len(dead) >= 4:
                 advice.append(
                     f"Wildcard candidate round: {len(dead)} squad players "

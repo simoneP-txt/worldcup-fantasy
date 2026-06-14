@@ -13,8 +13,9 @@ prints the moves to make by hand. It never logs into your FIFA account.
 
 - **Expected points:** each player's 2025/26 club stats (FBref) run through the official
   scoring table, blended with the fantasy price and his live World Cup form.
-- **Who starts:** the game's own prices encode a depth chart; injuries and confirmed
-  lineups discount it when an API key is set.
+- **Who starts:** the game's own prices encode a depth chart; confirmed lineups,
+  suspensions (both from the official FIFA Match Centre feed) and injury withdrawals
+  (Wikipedia) discount it — all free, no key required.
 - **How far the team goes:** Elo over ~49k internationals plus a Monte Carlo of the
   official bracket, calibrated with bookmaker odds. Players from likely finalists are
   worth more.
@@ -32,9 +33,10 @@ pip install -e . -r requirements.txt
 python -m wcfantasy advise
 ```
 
-The first run downloads and caches everything it needs into `data/`. Add a free
-[The Odds API](https://the-odds-api.com) or [API-Football](https://www.api-football.com)
-key for odds and injuries; without them it runs on the feeds and Elo alone.
+The first run downloads and caches everything it needs into `data/`. Availability
+(lineups, suspensions, injuries) needs no key. Add a free
+[The Odds API](https://the-odds-api.com) key for bookmaker odds; without it the model
+runs on Elo alone.
 
 ## Commands
 
@@ -53,11 +55,13 @@ All commands are `python -m wcfantasy <command>`.
 
 ## Data sources
 
-FIFA fantasy feeds (players, prices, fixtures, scores), [FBref](https://fbref.com) club
-stats via `soccerdata`, [martj42 international results](https://github.com/martj42/international_results)
-for the Elo ratings, [The Odds API](https://the-odds-api.com),
-[API-Football](https://www.api-football.com) and World Bank economics. Everything except
-the FIFA feeds is optional.
+FIFA fantasy feeds (players, prices, fixtures, scores), the official
+[FIFA Match Centre feed](https://api.fifa.com/api/v3) (confirmed lineups + suspensions,
+free and key-less), [Wikipedia](https://en.wikipedia.org/wiki/2026_FIFA_World_Cup_squads)
+for injury withdrawals, [FBref](https://fbref.com) club stats via `soccerdata`,
+[martj42 international results](https://github.com/martj42/international_results) for the
+Elo ratings, [The Odds API](https://the-odds-api.com) and World Bank economics.
+Everything except the FIFA feeds is optional.
 
 ## Notes
 

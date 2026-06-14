@@ -158,6 +158,33 @@ def test_simulate_respects_bracket_capacity():
     assert sum(champion.values()) == pytest.approx(1.0)
 
 
+def test_resolve_ko_pair_uses_real_result_by_pairing_not_position():
+    # completed match stored as home=7, away=3, away wins 0-1
+    actual_by_pair = {
+        (7, 3): {"homeSquadId": 7, "awaySquadId": 3,
+                 "homeScore": 0, "awayScore": 1, "status": "complete"}
+    }
+    sim = lambda h, a: -1  # sentinel: "this pairing was simulated"
+    # real result honoured in either lookup orientation, winner = away (3)
+    assert progression._resolve_ko_pair(7, 3, actual_by_pair, sim) == 3
+    assert progression._resolve_ko_pair(3, 7, actual_by_pair, sim) == 3
+    # a pairing with no completed feed match falls back to the simulator
+    assert progression._resolve_ko_pair(1, 2, actual_by_pair, sim) == -1
+    # a scheduled match (no score) is also simulated
+    scheduled = {(5, 6): {"homeSquadId": 5, "awaySquadId": 6, "status": "scheduled"}}
+    assert progression._resolve_ko_pair(5, 6, scheduled, sim) == -1
+
+
+def test_resolve_ko_pair_breaks_a_draw_on_penalties():
+    actual_by_pair = {
+        (7, 3): {"homeSquadId": 7, "awaySquadId": 3, "homeScore": 1,
+                 "awayScore": 1, "homePenaltyScore": 2, "awayPenaltyScore": 4,
+                 "status": "complete"}
+    }
+    sim = lambda h, a: -1
+    assert progression._resolve_ko_pair(7, 3, actual_by_pair, sim) == 3  # away wins shootout
+
+
 def test_bracket_file_is_well_formed():
     bracket = json.loads(progression._BRACKET_FILE.read_text(encoding="utf-8"))
     template = bracket["template"]

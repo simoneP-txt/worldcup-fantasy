@@ -5,6 +5,7 @@ from wcfantasy.data_sources.club_stats import match_name, normalize_name
 from wcfantasy.models.player_points import (
     NAILED_STARTER_CEILING,
     expected_points_per_match,
+    opponent_factor,
     project_club_ep,
     starter_probability,
 )
@@ -130,6 +131,22 @@ def test_backup_keeper_never_outranks_the_number_one():
     club_ep = pd.Series([4.0, 9.0], index=players.index)  # backup shines at club
     ep = expected_points_per_match(players, club_ep)
     assert ep.iloc[0] > 5 * ep.iloc[1]
+
+
+def test_opponent_factor_rewards_easier_fixtures():
+    players = pd.DataFrame([{"squadId": 1}, {"squadId": 2}])
+    rounds = [{"id": 1, "tournaments": [{"homeSquadId": 1, "awaySquadId": 2}]}]
+    ratings = {1: 1800.0, 2: 1400.0}  # team 1 much stronger
+    factor = opponent_factor(players, rounds, next_round=1, ratings=ratings)
+    assert factor.iloc[0] > 1.0  # strong team vs weak opponent -> boosted
+    assert factor.iloc[1] < 1.0  # weak team vs strong opponent -> discounted
+    assert factor.iloc[0] + factor.iloc[1] == pytest.approx(2.0)  # symmetric
+
+
+def test_opponent_factor_neutral_without_ratings():
+    players = pd.DataFrame([{"squadId": 1}, {"squadId": 2}])
+    rounds = [{"id": 1, "tournaments": [{"homeSquadId": 1, "awaySquadId": 2}]}]
+    assert (opponent_factor(players, rounds, 1, ratings=None) == 1.0).all()
 
 
 def test_normalize_name_strips_accents():

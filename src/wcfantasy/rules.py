@@ -70,6 +70,19 @@ EXTRA_TRANSFER_PENALTY = 3.0
 
 # Transfers confirmed during a live round only apply from the next round.
 
+# --------------------------------------------------------- suspensions
+
+# Disciplinary suspensions (official). A sending-off (straight red or two
+# yellows in one match), or a second yellow accumulated across matches in
+# the same window, bans the player from the next match. FIFA wipes single
+# yellow cards after the group stage and again after the quarter-finals,
+# so a player can never miss the final for an early-round caution.
+# Used to discount a known-suspended player's expected points to ~0.
+YELLOW_CARDS_FOR_BAN = 2
+# Round numbers after which the accumulated single-yellow tally resets:
+# 3 = end of the group stage, 6 = end of the quarter-finals.
+YELLOW_RESET_AFTER_ROUNDS = (3, 6)
+
 # -------------------------------------------------------------- boosters
 
 # One booster per round max, each usable once in the tournament. All of

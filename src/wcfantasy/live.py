@@ -418,7 +418,7 @@ def run(mark_changed: bool = False) -> None:
     # Injury / availability discount so a player ruled out is never
     # offered as a sub or captain target. Confirmed lineups (published
     # ~1h before kickoff) override the injuries feed when available.
-    injuries = availability_mod.availability_factors(squads, df)
+    injuries = availability_mod.availability_factors(squads, df, rounds, round_no)
     lineups = availability_mod.live_lineup_factors(rnd, squads, df)
     availability = {**injuries, **lineups}
     # Same EP basis as advise: blend in the club-stats prior, not the

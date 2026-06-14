@@ -138,6 +138,29 @@ def _group_fixtures(rounds: list[dict]) -> list[dict]:
     ]
 
 
+def _resolve_ko_pair(h, a, actual_by_pair: dict, ko_winner) -> int:
+    """Winner of a KO pairing (h, a): the real result if the feed has this
+    exact matchup completed, else `ko_winner(h, a)`.
+
+    Pure and unit-tested. The match is found by team pair in either
+    orientation, and the winner is read from the MATCH's own home/away (mh,
+    ma) - never from the lookup-key order - so a feed fixture stored as
+    (a, h) still resolves correctly. This is the fix for the old positional
+    zip, which could pin a real score onto the wrong simulated pairing.
+    """
+    m = actual_by_pair.get((h, a)) or actual_by_pair.get((a, h))
+    if m and m.get("homeScore") is not None and feed_status.result_usable(m.get("status")):
+        mh, ma = m["homeSquadId"], m["awaySquadId"]
+        hs, as_ = int(m["homeScore"]), int(m["awayScore"])
+        if hs != as_:
+            return mh if hs > as_ else ma
+        # decided in extra time / penalties
+        hp = m.get("homePenaltyScore") or 0
+        ap = m.get("awayPenaltyScore") or 0
+        return mh if hp >= ap else ma
+    return ko_winner(h, a)
+
+
 def survival_curve(
     players: pd.DataFrame,
     squads: list[dict],
@@ -262,6 +285,14 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
         diff = rating[h] - rating[a]
         return h if rng.random() < elo.expected_score(diff) else a
 
+    def resolve_pair(h, a, actual_by_pair):
+        """Winner of one KO pairing: the real result when the feed has this
+        exact matchup completed (either orientation), else a simulated one.
+        Looking up by team pair - not by position - is what keeps a
+        partially-played KO round from applying a real score to the wrong
+        simulated pairing."""
+        return _resolve_ko_pair(h, a, actual_by_pair, ko_winner)
+
     for sim in range(n_sims):
         # group standings
         points = dict.fromkeys(squad_ids, 0)
@@ -318,22 +349,17 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
                     for t in template[stage]
                 ]
 
+            # Real results are looked up by team pairing, not by position:
+            # the simulated `pairs` need not line up with the order of the
+            # completed matches in the feed (e.g. a half-played KO round).
+            actual_by_pair = {
+                (m["homeSquadId"], m["awaySquadId"]): m for m in actual
+            }
             winners = []
-            for (h, a), m in zip(
-                pairs, (actual + [None] * len(pairs))[: len(pairs)]
-            ):
+            for h, a in pairs:
                 reach_counts[h][round_no] += 1
                 reach_counts[a][round_no] += 1
-                if m and m.get("homeScore") is not None and feed_status.result_usable(m.get("status")):
-                    hs, as_ = int(m["homeScore"]), int(m["awayScore"])
-                    if hs != as_:
-                        winners.append(h if hs > as_ else a)
-                    else:  # decided in extra time / penalties
-                        hp = m.get("homePenaltyScore") or 0
-                        ap = m.get("awayPenaltyScore") or 0
-                        winners.append(h if hp >= ap else a)
-                else:
-                    winners.append(ko_winner(h, a))
+                winners.append(resolve_pair(h, a, actual_by_pair))
             prev_winners = winners
         champion_counts[prev_winners[0]] += 1
 

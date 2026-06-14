@@ -164,12 +164,18 @@ def run() -> None:
         else "club stats: OFF (price prior; run with soccerdata installed)"
     )
     avail_info = availability.last_run_info
-    avail_source = avail_info.get("source", "?")
-    avail_note = (
-        f"availability: {avail_info.get('flagged', 0)} flagged ({avail_source})"
-        if avail_source.startswith("api")
-        else f"availability: OFF ({avail_source})"
-    )
+    flagged = avail_info.get("flagged", 0)
+    if flagged:
+        breakdown = (
+            f"suspensions {avail_info.get('suspensions', 0)}, "
+            f"withdrawals {avail_info.get('withdrawals', 0)}, "
+            f"injuries {avail_info.get('injuries', 0)}"
+        )
+        avail_note = f"availability: {flagged} flagged ({breakdown})"
+    elif avail_info.get("fifa_reachable"):
+        avail_note = "availability: none flagged (FIFA Match Centre + Wikipedia)"
+    else:
+        avail_note = "availability: OFF (FIFA Match Centre unreachable)"
     cal_note = (
         "calibration: ON (data/state/calibration.json)"
         if player_points.CALIBRATION_FILE.exists()

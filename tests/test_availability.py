@@ -4,9 +4,9 @@ from wcfantasy.data_sources import availability
 
 
 SQUADS = [
-    {"id": 10, "name": "Switzerland"},
-    {"id": 47, "name": "USA"},
-    {"id": 41, "name": "Spain"},
+    {"id": 10, "name": "Switzerland", "abbr": "SUI"},
+    {"id": 47, "name": "USA", "abbr": "USA"},
+    {"id": 41, "name": "Spain", "abbr": "ESP"},
 ]
 
 
@@ -18,6 +18,8 @@ def _players() -> pd.DataFrame:
         {"id": 4, "name": "Lamine Yamal", "squadId": 41, "position": "MID"},
     ])
 
+
+# ----------------------------------------- API-Football injuries (optional)
 
 def test_injury_weight_known_and_unknown_statuses():
     assert availability.injury_weight("Questionable") == 0.5
@@ -60,21 +62,37 @@ def test_build_injury_factors_ignores_unmatched():
     assert availability.build_injury_factors(raw, SQUADS, _players()) == {}
 
 
-def test_build_fixture_id_map_matches_team_names():
-    raw = [
-        {"fixture": {"id": 111},
-         "teams": {"home": {"name": "Switzerland"}, "away": {"name": "United States"}}},
-        {"fixture": {"id": 222},
-         "teams": {"home": {"name": "Spain"}, "away": {"name": "Atlantis"}}},  # away unmatched
-    ]
-    fmap = availability.build_fixture_id_map(raw, SQUADS)
-    assert fmap == {(10, 47): 111}  # Switzerland=10, USA=47; Spain pair dropped
+# --------------------------------------------------------------- aggregator
+
+def test_merge_keeps_the_lowest_factor_per_player():
+    merged = availability._merge({1: 0.5}, {1: 0.0, 2: 0.4}, {3: 0.0})
+    assert merged == {1: 0.0, 2: 0.4, 3: 0.0}
 
 
-def test_availability_factors_off_without_key(monkeypatch, tmp_path):
-    # no key, no cache -> {} and a clean "off" note, never raises
+def test_availability_factors_off_when_all_sources_empty(monkeypatch, tmp_path):
+    # no key, FIFA/Wikipedia patched empty -> {} and a clean count, never raises
+    monkeypatch.setattr(availability.fifa_match, "suspension_factors", lambda *a, **k: {})
+    monkeypatch.setattr(
+        availability.wikipedia_squads, "withdrawal_factors", lambda *a, **k: {}
+    )
     monkeypatch.delenv("API_FOOTBALL_KEY", raising=False)
     monkeypatch.setattr(availability, "KEY_FILE", tmp_path / "missing.txt")
     monkeypatch.setattr(availability, "INJURIES_CACHE", tmp_path / "injuries.json")
     assert availability.availability_factors(SQUADS, _players()) == {}
     assert availability.last_run_info["flagged"] == 0
+
+
+def test_availability_factors_merges_suspensions_and_withdrawals(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        availability.fifa_match, "suspension_factors", lambda *a, **k: {1: 0.0}
+    )
+    monkeypatch.setattr(
+        availability.wikipedia_squads, "withdrawal_factors", lambda *a, **k: {2: 0.0}
+    )
+    monkeypatch.delenv("API_FOOTBALL_KEY", raising=False)
+    monkeypatch.setattr(availability, "KEY_FILE", tmp_path / "missing.txt")
+    out = availability.availability_factors(SQUADS, _players(), rounds=[], round_no=2)
+    assert out == {1: 0.0, 2: 0.0}
+    assert availability.last_run_info["suspensions"] == 1
+    assert availability.last_run_info["withdrawals"] == 1
+    assert availability.last_run_info["flagged"] == 2

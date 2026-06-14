@@ -269,14 +269,17 @@ def expected_points_per_match(
 
 
 def opponent_factor(
-    players: pd.DataFrame, rounds: list[dict], next_round: int
+    players: pd.DataFrame,
+    rounds: list[dict],
+    next_round: int,
+    ratings: dict[int, float] | None = None,
 ) -> pd.Series:
     """Scale next-round EP by fixture difficulty (Elo expected score).
 
-    Uses the ratings the progression model leaves in last_run_info; 1.0
-    everywhere when they are unavailable (offline fallback)."""
+    `ratings` (squadId -> Elo) comes from the progression run; pass it
+    explicitly instead of reaching into another module's globals. 1.0
+    everywhere when ratings are unavailable (offline fallback)."""
     neutral = pd.Series(1.0, index=players.index)
-    ratings = progression.last_run_info.get("ratings")
     rnd = next((r for r in rounds if r["id"] == next_round), None)
     if not ratings or rnd is None:
         return neutral
@@ -308,14 +311,18 @@ def expected_value(
     the total points a player is expected to add from here to the end.
     """
     out = players.copy()
-    # Progression first: it also leaves the Elo ratings in last_run_info
-    # for the opponent factor below.
+    # Progression first: it computes the Elo ratings used by the opponent
+    # factor. Read them here, once, right after the call that produces them
+    # and pass them down explicitly (no hidden cross-module coupling).
     future = progression.expected_future_rounds(players, squads, rounds, next_round)
+    ratings = progression.last_run_info.get("ratings")
     club_ep = club_prior(players)
     last_run_info["club_matched"] = int(club_ep.notna().sum())
-    availability = availability_mod.availability_factors(squads, players)
+    availability = availability_mod.availability_factors(
+        squads, players, rounds, next_round
+    )
     base = expected_points_per_match(players, club_ep, availability)
-    out["ep_match"] = base * opponent_factor(players, rounds, next_round)
+    out["ep_match"] = base * opponent_factor(players, rounds, next_round, ratings)
     out["future_rounds"] = out["squadId"].map(future).fillna(0.0)
     out["ep_horizon"] = base * out["future_rounds"]
     # P(plays) for the report: depth chart x availability. The depth-chart

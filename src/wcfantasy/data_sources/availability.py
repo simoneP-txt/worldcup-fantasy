@@ -1,27 +1,31 @@
-"""Player availability from API-Football (injuries + confirmed lineups).
+"""Player availability: one factor in [0, 1] = P(the player takes the pitch).
 
-The FIFA feed flags only `playing`/`transferred`: nothing about
-injuries, suspensions or fitness (a doubtful player looks identical to a
-nailed starter). This module fills that gap with an availability factor
-in [0, 1] = P(the player actually takes the pitch), fed into the starter
-probability so every advise/transfer decision discounts a doubtful or
-injured player automatically.
+The fantasy feed flags only `playing`/`transferred`: nothing about
+fitness, suspensions or who actually starts (a doubtful player looks
+identical to a nailed starter). This module fills that gap and feeds the
+starter probability, so every advise/transfer decision discounts a
+doubtful, injured or banned player automatically.
 
-Two signals, strongest first:
+It aggregates the free signals (strongest first); any source saying a
+player is less available wins (the minimum factor):
 
-1. Confirmed lineups (~1h before kickoff): a named starter is ~1.0, a
-   benched player gets `BENCH_FACTOR`, an omitted one 0.0. Decisive, but
-   only available close to kickoff (mainly useful to `live`).
-2. The injuries feed (days ahead): a flagged player is discounted by the
-   weight of his injury `type` (out/doubtful/questionable).
+1. Confirmed lineups (~1h before kickoff), from the official FIFA Match
+   Centre feed (data_sources.fifa_match): named starter 1.0, named sub
+   0.5, omitted 0.0. Decisive, but only close to kickoff -> `live`. Kept
+   separate in `live_lineup_factors` so it can override the rest.
+2. Suspensions (days ahead), derived from FIFA bookings (fifa_match): a
+   sending-off or a second accumulated yellow -> 0.0 for the next round.
+3. Injury withdrawals (days ahead), from the Wikipedia squads page
+   (data_sources.wikipedia_squads): the only free source for fitness the
+   FIFA feeds lack -> 0.0.
+4. API-Football injuries (optional, days ahead): kept for when a paid key
+   is configured. Inert on the free plan (no 2026 season access), so it
+   contributes {} and the other signals carry the load.
 
 Optional, same contract as the other data_sources: returns {} on any
 failure (no key, network, rate limit, schema drift) and the model falls
-back to the price depth chart alone. Key from the API_FOOTBALL_KEY env
-var or api_football_key.txt in the project root (gitignored).
-
-API-Football ids and response shapes are marked TODO(verify): confirm
-them on the first real call (the World Cup league id especially).
+back to the price depth chart alone. The API-Football key is read from
+API_FOOTBALL_KEY or api_football_key.txt (gitignored).
 """
 
 import json
@@ -33,18 +37,22 @@ import pandas as pd
 import requests
 
 from ..config import EXTERNAL_DIR, PROJECT_ROOT
+from . import fifa_match, wikipedia_squads
 from .club_stats import match_name
 from .names import EXTERNAL_TO_FIFA
 
 log = logging.getLogger(__name__)
 
+# Filled on each run; advise reports it to the user.
+last_run_info: dict = {}
+
+
+# ----------------------------------------- API-Football injuries (optional)
+
 BASE = "https://v3.football.api-sports.io"
 KEY_FILE = PROJECT_ROOT / "api_football_key.txt"
 INJURIES_CACHE = EXTERNAL_DIR / "injuries.json"
-FIXTURES_CACHE = EXTERNAL_DIR / "af_fixtures.json"
 
-# TODO(verify) on the first keyed call: GET /leagues?search=world cup.
-# 1 is API-Football's historical id for the men's World Cup.
 WORLD_CUP_LEAGUE_ID = 1
 SEASON = 2026
 
@@ -57,11 +65,6 @@ STATUS_WEIGHT = {
     "coach decision": 0.35,
 }
 DEFAULT_INJURY_WEIGHT = 0.0
-# A confirmed-lineup substitute still tends to get some minutes.
-BENCH_FACTOR = 0.5
-
-# Filled on each run; advise reports the count to the user.
-last_run_info: dict = {}
 
 
 def api_key() -> str | None:
@@ -139,113 +142,67 @@ def build_injury_factors(
     return factors
 
 
-def availability_factors(
+def _api_football_injuries(
     squads: list[dict], players: pd.DataFrame
 ) -> dict[int, float]:
-    """P(plays) in [0, 1] for flagged players; absent id = assume fit.
-
-    {} when no key/data so the caller cleanly falls back to the depth
-    chart alone.
-    """
+    """API-Football injuries; {} without a key or on the free plan."""
     raw = _get("/injuries", INJURIES_CACHE, league=WORLD_CUP_LEAGUE_ID, season=SEASON)
-    if not raw:
-        last_run_info["flagged"] = 0
-        # Distinguish a missing key from a key that returned nothing: the
-        # free API-Football plan has no access to season 2026, so a valid
-        # key still yields an empty response there.
-        last_run_info["source"] = (
-            "no API_FOOTBALL_KEY" if api_key() is None
-            else "key set, no 2026 data (free plan)"
-        )
-        return {}
-    factors = build_injury_factors(raw, squads, players)
-    last_run_info["flagged"] = len(factors)
-    last_run_info["source"] = "api-football injuries"
-    return factors
+    return build_injury_factors(raw, squads, players) if raw else {}
 
 
-def lineup_factors(
-    fixtures: list[dict], squads: list[dict], players: pd.DataFrame
-) -> dict[int, float]:
-    """Confirmed-lineup availability for a set of fixture ids (live use).
+# --------------------------------------------------------------- aggregator
 
-    Overrides the injuries signal once a lineup is published: named
-    starters 1.0, named subs BENCH_FACTOR, everyone else in those squads
-    0.0. Squads with no published lineup are left untouched (absent).
-    """
-    by_squad = _squad_name_index(players)
-    squad_names = {s["name"]: s["id"] for s in squads}
-    factors: dict[int, float] = {}
-    for fx in fixtures:
-        lineups = _get(
-            "/fixtures/lineups", EXTERNAL_DIR / f"lineup_{fx}.json", fixture=fx
-        )
-        if not lineups:
-            continue
-        for team_block in lineups:
-            team_name = (team_block.get("team") or {}).get("name", "")
-            sid = _match_squad(team_name, squad_names)
-            if sid is None or sid not in by_squad:
-                continue
-            roster = by_squad[sid]
-            named = {
-                "start": [p.get("player", {}).get("name", "") for p in team_block.get("startXI", [])],
-                "sub": [p.get("player", {}).get("name", "") for p in team_block.get("substitutes", [])],
-            }
-            for name, pid in roster:
-                if match_name_in(name, named["start"]):
-                    factors[int(pid)] = 1.0
-                elif match_name_in(name, named["sub"]):
-                    factors[int(pid)] = BENCH_FACTOR
-                else:
-                    factors[int(pid)] = 0.0
-    return factors
-
-
-def match_name_in(fifa_name: str, api_names: list[str]) -> bool:
-    return bool(api_names) and match_name(fifa_name, api_names, cutoff=0.82) is not None
-
-
-def build_fixture_id_map(
-    raw: list[dict], squads: list[dict]
-) -> dict[tuple[int, int], int]:
-    """{(home squadId, away squadId): API-Football fixture id} from a
-    /fixtures response. Pure (no network), so it is unit-tested."""
-    squad_names = {s["name"]: s["id"] for s in squads}
-    out: dict[tuple[int, int], int] = {}
-    for item in raw:
-        fx = item.get("fixture") or {}
-        teams = item.get("teams") or {}
-        hid = _match_squad((teams.get("home") or {}).get("name", ""), squad_names)
-        aid = _match_squad((teams.get("away") or {}).get("name", ""), squad_names)
-        if hid is not None and aid is not None and fx.get("id") is not None:
-            out[(hid, aid)] = int(fx["id"])
+def _merge(*sources: dict[int, float]) -> dict[int, float]:
+    """Combine availability dicts, keeping the lowest factor per player:
+    any source flagging a player as less available wins."""
+    out: dict[int, float] = {}
+    for source in sources:
+        for pid, value in source.items():
+            out[pid] = min(out.get(pid, 1.0), value)
     return out
 
 
-def _world_cup_fixture_ids(squads: list[dict]) -> dict[tuple[int, int], int]:
-    raw = _get("/fixtures", FIXTURES_CACHE, league=WORLD_CUP_LEAGUE_ID, season=SEASON)
-    return build_fixture_id_map(raw, squads) if raw else {}
+def availability_factors(
+    squads: list[dict],
+    players: pd.DataFrame,
+    rounds: list[dict] | None = None,
+    round_no: int | None = None,
+) -> dict[int, float]:
+    """P(plays) in [0, 1] for flagged players; absent id = assume fit.
+
+    Merges suspensions (FIFA), injury withdrawals (Wikipedia) and, when a
+    paid key is set, API-Football injuries. Suspensions need the fixture
+    calendar and target round; pass `rounds`/`round_no` (advise and live
+    do). {} when nothing is flagged so the caller cleanly falls back to
+    the depth chart alone.
+    """
+    suspensions = (
+        fifa_match.suspension_factors(rounds, round_no, squads, players)
+        if rounds is not None and round_no is not None
+        else {}
+    )
+    withdrawals = wikipedia_squads.withdrawal_factors(squads, players)
+    injuries = _api_football_injuries(squads, players)
+
+    merged = _merge(suspensions, withdrawals, injuries)
+    last_run_info.update(
+        flagged=len(merged),
+        suspensions=len(suspensions),
+        withdrawals=len(withdrawals),
+        injuries=len(injuries),
+        fifa_reachable=fifa_match.last_run_info.get("reachable", False),
+    )
+    return merged
 
 
 def live_lineup_factors(
     rnd: dict, squads: list[dict], players: pd.DataFrame
 ) -> dict[int, float]:
-    """Confirmed-lineup availability for the fixtures of one round.
+    """Confirmed-lineup availability for one round's fixtures (live use).
 
-    Maps each fixture in the round to its API-Football id and reads the
-    published lineups (lineup_factors), the strongest availability signal
-    (~1h before kickoff). Returns {} when no key/data so the caller falls
-    back to the injuries feed; note the API-Football free plan has no
-    access to the current World Cup season, so this stays empty there.
+    Delegates to the FIFA Match Centre feed: published lineups (~1h before
+    kickoff) are the strongest signal and override the injuries/suspension
+    factors in `live`. {} when no lineup is out yet or the feed is
+    unreachable, so the caller falls back to the other signals.
     """
-    fid_map = _world_cup_fixture_ids(squads)
-    if not fid_map:
-        return {}
-    fixture_ids = []
-    for m in rnd.get("tournaments", []):
-        h, a = m.get("homeSquadId"), m.get("awaySquadId")
-        fid = fid_map.get((h, a)) or fid_map.get((a, h))
-        if fid is not None:
-            fixture_ids.append(fid)
-    return lineup_factors(fixture_ids, squads, players) if fixture_ids else {}
+    return fifa_match.lineup_factors(rnd, squads, players)
