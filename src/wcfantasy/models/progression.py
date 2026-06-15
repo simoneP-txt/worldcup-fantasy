@@ -28,6 +28,7 @@ heuristic so `advise` keeps working offline.
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -172,6 +173,11 @@ def survival_curve(
     try:
         return _simulate_with_market(squads, rounds, n_sims, seed)
     except Exception:
+        # The broad catch keeps the tool working when a data source breaks,
+        # but it can also hide a real bug behind a much weaker heuristic.
+        # WCFANTASY_STRICT re-raises so failures are visible while debugging.
+        if os.environ.get("WCFANTASY_STRICT"):
+            raise
         log.exception("Monte Carlo simulation failed, using price heuristic")
         last_run_info.update(model="price heuristic (offline fallback)")
         last_run_info.pop("ratings", None)  # no stale opponent factors
@@ -209,16 +215,32 @@ def _simulate_with_market(squads, rounds, n_sims, seed):
     last_run_info["ratings"] = rating
 
     if outright:
-        nudged = dict(rating)
-        for sid, p_market in outright.items():
-            p_sim = champion.get(sid, 0.0)
-            if p_market > 1e-4 and p_sim > 1e-4:
-                delta = ODDS_NUDGE_GAIN * math.log(p_market / p_sim)
-                nudged[sid] += max(-ODDS_NUDGE_MAX, min(ODDS_NUDGE_MAX, delta))
+        nudged = nudge_ratings(rating, outright, champion)
         curve, _ = _simulate(squads, rounds, nudged, probs_fn, h2h, n_sims, seed)
         last_run_info["model"] = "Elo + economics + market calibration"
         last_run_info["ratings"] = nudged
     return curve
+
+
+def nudge_ratings(
+    rating: dict[int, float],
+    outright: dict[int, float],
+    champion: dict[int, float],
+) -> dict[int, float]:
+    """Elo ratings nudged toward the bookmaker outright probabilities.
+
+    For each quoted team, shift its rating by GAIN * ln(p_market / p_sim),
+    clamped to +-MAX, so the market corrects the model rather than replacing
+    it. A team with no usable market or simulated probability, or one not in
+    the rating table, is left unchanged. Pure and unit-tested.
+    """
+    nudged = dict(rating)
+    for sid, p_market in outright.items():
+        p_sim = champion.get(sid, 0.0)
+        if p_market > 1e-4 and p_sim > 1e-4 and sid in nudged:
+            delta = ODDS_NUDGE_GAIN * math.log(p_market / p_sim)
+            nudged[sid] += max(-ODDS_NUDGE_MAX, min(ODDS_NUDGE_MAX, delta))
+    return nudged
 
 
 def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
@@ -376,6 +398,26 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
     return curve, champion
 
 
+def future_rounds_from_curve(curve: pd.DataFrame, next_round: int) -> pd.Series:
+    """Sum of P(still playing) over rounds >= next_round, per squadId."""
+    future = [r for r in curve.columns if r >= next_round]
+    return curve[future].sum(axis=1)
+
+
+def advance_from_curve(curve: pd.DataFrame, next_round: int) -> pd.Series:
+    """P(team reaches the round AFTER next_round), per squadId.
+
+    This is exactly what progressing one knockout round means (winning the
+    next match), so it is the right signal for the Qualification booster -
+    not the multi-round 'expected to go deep' that future_rounds measures.
+    Zero past the final (no round to advance into).
+    """
+    target = next_round + 1
+    if target in curve.columns:
+        return curve[target]
+    return pd.Series(0.0, index=curve.index)
+
+
 def expected_future_rounds(
     players: pd.DataFrame,
     squads: list[dict],
@@ -383,6 +425,4 @@ def expected_future_rounds(
     next_round: int,
 ) -> pd.Series:
     """Sum of P(still playing) over rounds >= next_round, per squadId."""
-    curve = survival_curve(players, squads, rounds)
-    future = [r for r in curve.columns if r >= next_round]
-    return curve[future].sum(axis=1)
+    return future_rounds_from_curve(survival_curve(players, squads, rounds), next_round)

@@ -48,6 +48,13 @@ STARTER_STATUS = 1
 BENCH_STATUS = 2
 # A confirmed-lineup substitute still tends to get some minutes.
 BENCH_FACTOR = 0.5
+# A squad member NOT on the published list was left out -> 0.0, but only
+# trust that when EVERY published name bridged to a fantasy player: an
+# unbridged published name could BE one of those "omitted" players under a
+# different spelling, so reading silence as 'dropped' would falsely rule
+# out a real starter. Above this many unresolved names, skip the 0.0s for
+# that side (keep the positive signals, fall back to the depth chart).
+MAX_UNRESOLVED_FOR_OMISSION = 0
 
 # `MatchStatus` in the calendar/detail feeds: 0 = completed, 1 = scheduled
 # (other values cover live/abandoned and are ignored for suspensions).
@@ -96,20 +103,28 @@ def _fetch_calendar() -> list | None:
         return None
 
 
-def _fetch_match(id_stage, id_match) -> dict | None:
-    """One match detail (Players + Bookings). Cached forever for completed
-    matches (immutable once played); refetched only when not yet cached."""
-    cache = _match_cache(id_match)
-    if cache.exists():
-        return json.loads(cache.read_text(encoding="utf-8"))
+def _fetch_match(id_stage, id_match, *, cache: bool = True) -> dict | None:
+    """One match detail (Players + Bookings).
+
+    `cache=True` (suspensions path) keeps a permanent on-disk copy: a
+    COMPLETED match is immutable once played. `cache=False` (the lineups
+    path for a not-yet-finished match) always refetches and never writes,
+    because the pre-match detail mutates as the confirmed XI is published
+    ~1h before kickoff - caching an early, lineup-less payload would hide
+    the lineup from every later `live` run.
+    """
+    cache_file = _match_cache(id_match)
+    if cache and cache_file.exists():
+        return json.loads(cache_file.read_text(encoding="utf-8"))
     try:
         data = fifa_client.fifa_api_get(
             f"/live/football/{WC_COMPETITION_ID}/{WC_SEASON_ID}/{id_stage}/{id_match}",
             language="en",
         )
         if isinstance(data, dict):
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(data), encoding="utf-8")
+            if cache:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps(data), encoding="utf-8")
             return data
         return None
     except Exception as exc:
@@ -147,10 +162,13 @@ def parse_lineup_factors(
     """{fantasy id -> availability} from one match detail's lineups.
 
     Pure (no network), unit-tested. For each side whose lineup is
-    published (non-empty Players), every fantasy player in that squad is
-    scored: named starter 1.0, named sub BENCH_FACTOR, everyone else 0.0.
-    Sides with no published lineup are left untouched (absent from the
-    result), so the caller keeps the depth-chart prior for them.
+    published (non-empty Players), each PUBLISHED name is resolved to a
+    fantasy player: named starter 1.0, named sub BENCH_FACTOR. A squad
+    member no published name resolved to is ruled out (0.0) ONLY when every
+    published name bridged (see MAX_UNRESOLVED_FOR_OMISSION) - otherwise a
+    spelling miss on a real starter must not read as 'dropped', so only the
+    positive signals are kept and the rest fall back to the depth chart.
+    Sides with no published lineup are left untouched.
     """
     by_abbr = abbr_to_squad(squads)
     by_squad = squad_roster(players)
@@ -163,28 +181,36 @@ def parse_lineup_factors(
         sid = by_abbr.get(block.get("IdCountry"))
         if sid is None or sid not in by_squad:
             continue
-        starters = [
-            _team_name(p.get("PlayerName"))
+        roster = by_squad[sid]
+        roster_names = [n for n, _ in roster]
+        id_of = {n: int(i) for n, i in roster}
+
+        published = [
+            (_team_name(p.get("PlayerName")), 1.0)
             for p in squad_players
             if p.get("Status") == STARTER_STATUS
-        ]
-        subs = [
-            _team_name(p.get("PlayerName"))
+        ] + [
+            (_team_name(p.get("PlayerName")), BENCH_FACTOR)
             for p in squad_players
             if p.get("Status") == BENCH_STATUS
         ]
-        for name, pid in by_squad[sid]:
-            if _name_in(name, starters):
-                factors[int(pid)] = 1.0
-            elif _name_in(name, subs):
-                factors[int(pid)] = BENCH_FACTOR
-            else:
-                factors[int(pid)] = 0.0
+
+        resolved: dict[int, float] = {}
+        unresolved = 0
+        for api_name, value in published:
+            matched = match_name(api_name, roster_names, cutoff=0.82)
+            if matched is None:
+                unresolved += 1
+                continue
+            pid = id_of[matched]
+            resolved[pid] = max(resolved.get(pid, 0.0), value)
+        factors.update(resolved)
+
+        if unresolved <= MAX_UNRESOLVED_FOR_OMISSION:
+            for _, pid in roster:
+                if int(pid) not in resolved:
+                    factors[int(pid)] = 0.0
     return factors
-
-
-def _name_in(fifa_name: str, api_names: list[str]) -> bool:
-    return bool(api_names) and match_name(fifa_name, api_names, cutoff=0.82) is not None
 
 
 # ------------------------------------------------------- pure: suspensions
@@ -350,13 +376,16 @@ def lineup_factors(
     calendar = _fetch_calendar()
     if not calendar:
         return {}
-    # {(home abbr, away abbr) -> (idStage, idMatch)} from the calendar.
+    # {(home abbr, away abbr) -> (idStage, idMatch, MatchStatus)} from the
+    # calendar. The status decides caching: a completed match is immutable
+    # (cache it), a scheduled/live one must be refetched so a confirmed
+    # lineup published after an earlier run is not missed.
     fmap: dict[tuple[str, str], tuple] = {}
     for m in calendar:
         h = (m.get("Home") or {}).get("IdCountry")
         a = (m.get("Away") or {}).get("IdCountry")
         if h and a and m.get("IdMatch") is not None:
-            fmap[(h, a)] = (m.get("IdStage"), m.get("IdMatch"))
+            fmap[(h, a)] = (m.get("IdStage"), m.get("IdMatch"), m.get("MatchStatus"))
 
     factors: dict[int, float] = {}
     for m in rnd.get("tournaments", []):
@@ -364,7 +393,7 @@ def lineup_factors(
         ref = fmap.get((h, a)) or fmap.get((a, h))
         if ref is None:
             continue
-        detail = _fetch_match(ref[0], ref[1])
+        detail = _fetch_match(ref[0], ref[1], cache=ref[2] == MATCH_COMPLETED)
         if detail:
             factors.update(parse_lineup_factors(detail, squads, players))
     return factors

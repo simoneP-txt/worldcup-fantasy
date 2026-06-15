@@ -21,35 +21,44 @@ log = logging.getLogger(__name__)
 _LATEST = RAW_DIR / "latest"
 
 
-def _fetch(feed: str) -> bytes:
-    url = f"{FIFA_JSON_BASE}{feed}.json"
+def _request_with_retry(url: str, **kwargs) -> requests.Response:
+    """GET with 3 attempts and exponential backoff.
+
+    Retries BOTH non-200 responses and transport errors (the latter used to
+    propagate on the first try, with no retry). Returns the final 200
+    Response, or raises: the last HTTP error when the server answered, else
+    a RuntimeError when the host was never reachable.
+    """
+    resp = None
     for attempt in range(3):
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=20)
-        if resp.status_code == 200:
-            return resp.content
-        log.warning("GET %s -> %s (attempt %d)", url, resp.status_code, attempt + 1)
-        time.sleep(2**attempt)
-    resp.raise_for_status()
-    raise RuntimeError(f"unreachable: {url}")
+        try:
+            resp = requests.get(url, headers=HTTP_HEADERS, timeout=20, **kwargs)
+            if resp.status_code == 200:
+                return resp
+            log.warning("GET %s -> %s (attempt %d)", url, resp.status_code, attempt + 1)
+        except requests.RequestException as exc:
+            resp = None
+            log.warning("GET %s failed: %s (attempt %d)", url, exc, attempt + 1)
+        if attempt < 2:
+            time.sleep(2**attempt)
+    if resp is not None:
+        resp.raise_for_status()
+    raise RuntimeError(f"unreachable after retries: {url}")
+
+
+def _fetch(feed: str) -> bytes:
+    return _request_with_retry(f"{FIFA_JSON_BASE}{feed}.json").content
 
 
 def fifa_api_get(path: str, **params) -> dict | list:
     """GET an api.fifa.com/api/v3 endpoint (the official Match Centre feed).
 
-    Same browser-UA, retry policy as the fantasy feeds, but returns parsed
-    JSON. Raises on failure so optional callers (availability) can wrap it
-    and degrade cleanly to {}. `path` is appended to FIFA_DATA_API_BASE
-    and must start with '/'.
+    Same browser-UA and retry policy as the fantasy feeds, but returns
+    parsed JSON. Raises on failure so optional callers (availability) can
+    wrap it and degrade cleanly to {}. `path` is appended to
+    FIFA_DATA_API_BASE and must start with '/'.
     """
-    url = f"{FIFA_DATA_API_BASE}{path}"
-    for attempt in range(3):
-        resp = requests.get(url, headers=HTTP_HEADERS, params=params, timeout=20)
-        if resp.status_code == 200:
-            return resp.json()
-        log.warning("GET %s -> %s (attempt %d)", url, resp.status_code, attempt + 1)
-        time.sleep(2**attempt)
-    resp.raise_for_status()
-    raise RuntimeError(f"unreachable: {url}")
+    return _request_with_retry(f"{FIFA_DATA_API_BASE}{path}", params=params).json()
 
 
 def _latest_path(feed: str) -> Path:

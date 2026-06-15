@@ -11,7 +11,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="wcfantasy")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("advise", help="full recommendation for the next round")
+    advise_p = sub.add_parser("advise", help="full recommendation for the next round")
+    advise_p.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="build the unconstrained ideal 15 (ignoring the saved team and "
+        "transfer limits) and show how far your current squad is from it; "
+        "reference only, not saved",
+    )
     sub.add_parser("fetch", help="refresh FIFA data only")
 
     live_p = sub.add_parser(
@@ -50,7 +57,7 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "advise":
-        advise.run()
+        advise.run(from_scratch=args.from_scratch)
     elif args.command == "fetch":
         changed = fifa_client.refresh()
         print({k: ("updated" if v else "unchanged") for k, v in changed.items()})

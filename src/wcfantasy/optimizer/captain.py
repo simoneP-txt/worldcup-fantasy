@@ -13,11 +13,11 @@ the official effects (rules.BOOSTERS) plus the user's strategy:
   one that reaches the final is +2.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 
-from .. import rules
+from .. import fixtures, rules
 from ..state import TeamState
 from .squad import SquadSolution
 
@@ -38,13 +38,6 @@ def ordered_bench(df: pd.DataFrame, solution: SquadSolution) -> tuple[list[int],
     return outfield, gk
 
 
-def _kickoff(value) -> datetime | None:
-    try:
-        return datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return None
-
-
 def captain_timing_note(
     df: pd.DataFrame,
     solution: SquadSolution,
@@ -63,14 +56,7 @@ def captain_timing_note(
     rnd = next((r for r in rounds if r["id"] == next_round), None)
     if rnd is None:
         return None
-    kickoff: dict[int, datetime] = {}
-    for m in rnd.get("tournaments", []):
-        when = _kickoff(m.get("date"))
-        if when is None:
-            continue
-        for key in ("homeSquadId", "awaySquadId"):
-            if m.get(key) is not None:
-                kickoff[m[key]] = when
+    kickoff = fixtures.kickoffs_by_squad(rnd)
 
     starters = df[df["id"].isin(solution.starter_ids)]
     ranked = starters.sort_values("ep_match", ascending=False)
@@ -103,6 +89,46 @@ def captain_timing_note(
     return None
 
 
+def captain_by_timing(
+    df: pd.DataFrame,
+    solution: SquadSolution,
+    rounds: list[dict],
+    next_round: int,
+    tolerance: float = 0.92,
+) -> int:
+    """Captain pick adjusted for kickoff order (option value).
+
+    The ILP captains the highest-EP starter. But the armband is switchable
+    live (old captain COMPLETED -> new one not yet played), so among the
+    starters within `tolerance` of the top EP the captaincy should go to
+    whoever plays EARLIEST: if he flops you can still move it to a later
+    contender, never the reverse. Returns the chosen captain id, falling
+    back to the ILP pick when there is no near-equal contender or no kickoff
+    time to act on. captain_timing_note then explains the choice.
+    """
+    starters = df[df["id"].isin(solution.starter_ids)]
+    if starters.empty:
+        return solution.captain_id
+    top_ep = float(starters["ep_match"].max())
+    contenders = starters[starters["ep_match"] >= tolerance * top_ep]
+    rnd = next((r for r in rounds if r["id"] == next_round), None)
+    if rnd is None or len(contenders) <= 1:
+        return solution.captain_id
+
+    kickoff = fixtures.kickoffs_by_squad(rnd)
+    far_future = datetime.max.replace(tzinfo=timezone.utc)
+
+    def sort_key(row: dict):
+        # earliest kickoff first; unknown kickoff sorts last; higher EP
+        # breaks a same-time tie so the stronger player keeps the armband.
+        return (kickoff.get(int(row["squadId"]), far_future), -float(row["ep_match"]))
+
+    best = min(contenders.to_dict("records"), key=sort_key)
+    if kickoff.get(int(best["squadId"]), far_future) is far_future:
+        return solution.captain_id  # no timing info: keep the ILP pick
+    return int(best["id"])
+
+
 def twelfth_man_pick(df: pd.DataFrame, solution: SquadSolution) -> pd.Series:
     """Best 12th Man: highest-EP player OUTSIDE the squad.
 
@@ -114,12 +140,16 @@ def twelfth_man_pick(df: pd.DataFrame, solution: SquadSolution) -> pd.Series:
 
 
 def _progressing_starters(starters: pd.DataFrame, next_round: int) -> int:
-    """Starters favoured to progress to the next knockout round.
+    """Starters favoured to WIN their next match (advance one knockout round).
 
-    future_rounds is the sum of P(still playing) from next_round on; a value
-    above the rounds left AFTER this one means the team is favoured to go
-    through (so the Qualification +2 is likely to land).
+    The Qualification +2 lands for advancing a SINGLE round, so the right
+    signal is P(team reaches the following round) > 0.5 - the `p_advance`
+    column. The older `future_rounds > 8 - next_round + 0.5` heuristic
+    measured 'favoured to go all the way' and only coincided at the SF; it
+    stays as a fallback for callers that do not carry p_advance.
     """
+    if "p_advance" in starters:
+        return int((starters["p_advance"] > 0.5).sum())
     threshold = 8 - next_round + 0.5
     return int((starters["future_rounds"] > threshold).sum())
 

@@ -103,6 +103,18 @@ def test_survival_curve_falls_back_when_simulation_raises(monkeypatch):
     assert (curve.loc[3] == 0.0).all()
 
 
+def test_survival_curve_strict_reraises_instead_of_falling_back(monkeypatch):
+    players, squads = _fallback_inputs()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulation unavailable")
+
+    monkeypatch.setattr(progression, "_simulate_with_market", boom)
+    monkeypatch.setenv("WCFANTASY_STRICT", "1")
+    with pytest.raises(RuntimeError):
+        progression.survival_curve(players, squads, rounds=[])
+
+
 # ------------------------------------------------- end-to-end bracket sim
 
 def _synthetic_world():
@@ -183,6 +195,22 @@ def test_resolve_ko_pair_breaks_a_draw_on_penalties():
     }
     sim = lambda h, a: -1
     assert progression._resolve_ko_pair(7, 3, actual_by_pair, sim) == 3  # away wins shootout
+
+
+def test_nudge_ratings_moves_toward_market_and_skips_unusable():
+    rating = {1: 1500.0, 2: 1500.0, 3: 1500.0}
+    champion = {1: 0.10, 2: 0.10, 3: 0.0}
+    outright = {1: 0.20, 2: 0.05, 3: 0.30, 99: 0.10}  # 99 is not a squad
+    nudged = progression.nudge_ratings(rating, outright, champion)
+    assert nudged[1] > 1500.0   # market rates it above the sim -> rating up
+    assert nudged[2] < 1500.0   # market below the sim -> rating down
+    assert nudged[3] == 1500.0  # p_sim 0 -> no usable ratio, unchanged
+    assert 99 not in nudged     # unknown team ignored
+
+
+def test_nudge_ratings_is_clamped():
+    big = progression.nudge_ratings({1: 1500.0}, {1: 0.99}, {1: 1e-3})
+    assert big[1] - 1500.0 == pytest.approx(progression.ODDS_NUDGE_MAX)
 
 
 def test_bracket_file_is_well_formed():

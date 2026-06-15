@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 from rich.console import Console
 
-from . import feed_status, features, fifa_client, rules, state
+from . import feed_status, features, fifa_client, fixtures, rules, state
 from .data_sources import availability as availability_mod
 from .models import player_points
 
@@ -92,17 +92,8 @@ def squad_phases(rnd: dict) -> dict[int, str]:
 
 
 def round_kickoffs(rnd: dict) -> dict[int, datetime]:
-    """squadId -> kickoff time of its match in this round."""
-    out: dict[int, datetime] = {}
-    for m in rnd.get("tournaments", []):
-        try:
-            when = datetime.fromisoformat(str(m.get("date")))
-        except (TypeError, ValueError):
-            continue
-        for key in ("homeSquadId", "awaySquadId"):
-            if m.get(key) is not None:
-                out[m[key]] = when
-    return out
+    """squadId -> kickoff time of its match in this round (tz-aware)."""
+    return fixtures.kickoffs_by_squad(rnd)
 
 
 def _deadline(kickoffs: dict[int, datetime] | None, squad_id: int) -> str:

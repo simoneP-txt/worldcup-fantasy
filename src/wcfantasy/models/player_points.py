@@ -312,9 +312,13 @@ def expected_value(
     """
     out = players.copy()
     # Progression first: it computes the Elo ratings used by the opponent
-    # factor. Read them here, once, right after the call that produces them
-    # and pass them down explicitly (no hidden cross-module coupling).
-    future = progression.expected_future_rounds(players, squads, rounds, next_round)
+    # factor. Run the (seeded) simulation once and derive everything from the
+    # one survival curve - the horizon weight, the next-round advance
+    # probability for the Qualification booster - then read the ratings it
+    # produced and pass them down explicitly (no hidden cross-module coupling).
+    curve = progression.survival_curve(players, squads, rounds)
+    future = progression.future_rounds_from_curve(curve, next_round)
+    advance = progression.advance_from_curve(curve, next_round)
     ratings = progression.last_run_info.get("ratings")
     club_ep = club_prior(players)
     last_run_info["club_matched"] = int(club_ep.notna().sum())
@@ -324,6 +328,9 @@ def expected_value(
     base = expected_points_per_match(players, club_ep, availability)
     out["ep_match"] = base * opponent_factor(players, rounds, next_round, ratings)
     out["future_rounds"] = out["squadId"].map(future).fillna(0.0)
+    # P(team wins its next match), for the Qualification booster (advancing
+    # ONE round, not going deep). Distinct from future_rounds on purpose.
+    out["p_advance"] = out["squadId"].map(advance).fillna(0.0)
     out["ep_horizon"] = base * out["future_rounds"]
     # P(plays) for the report: depth chart x availability. The depth-chart
     # part scaled the prior; the availability part scaled the final EP.

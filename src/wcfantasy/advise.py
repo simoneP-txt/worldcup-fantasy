@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from rich.console import Console
 from rich.table import Table
 
-from . import feed_status, features, fifa_client, rules, state
+from . import feed_status, features, fifa_client, fixtures, rules, state
 from .config import STATE_DIR
 from .data_sources import availability
 from .models import player_points, progression
@@ -49,16 +49,10 @@ def fixture_schedule(
     by_squad = display.groupby(squad_rows["squadId"]).apply(list)
     tz = _rome_tz()
 
-    def kickoff(match: dict) -> datetime | None:
-        try:
-            when = datetime.fromisoformat(str(match.get("date")))
-        except (TypeError, ValueError):
-            return None
-        return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
-
     matches = sorted(
         rnd.get("tournaments", []),
-        key=lambda m: kickoff(m) or datetime.max.replace(tzinfo=timezone.utc),
+        key=lambda m: fixtures.parse_kickoff(m.get("date"))
+        or datetime.max.replace(tzinfo=timezone.utc),
     )
     lines = []
     for m in matches:
@@ -68,7 +62,7 @@ def fixture_schedule(
         ]
         if not involved:
             continue
-        when = kickoff(m)
+        when = fixtures.parse_kickoff(m.get("date"))
         stamp = f"{when.astimezone(tz):%a %d %b %H:%M}" if when else "date TBD"
         names = ", ".join(n for sid in involved for n in by_squad[sid])
         lines.append(
@@ -132,7 +126,52 @@ def _squad_table(df, solution: SquadSolution) -> Table:
     return table
 
 
-def run() -> None:
+def squad_comparison(df, ideal: SquadSolution, current_ids: list[int]) -> list[str]:
+    """How the saved squad stacks up against the unconstrained ideal 15.
+
+    Overlap, the upgrades the ideal would bring in, the players it would
+    drop, and the per-round EP gap (sum of ep_match over each 15). A purely
+    informational view: the ideal ignores the transfer limits, so it is a
+    target to steer toward (over several windows or a Wildcard), not a plan
+    to apply in one go.
+    """
+    by_id = df.set_index("id")
+    ideal_ids = set(ideal.squad_ids)
+    current = set(current_ids)
+    overlap = ideal_ids & current
+
+    def ep(pid: int) -> float:
+        return float(by_id.loc[pid, "ep_match"]) if pid in by_id.index else 0.0
+
+    def ep_sum(ids) -> float:
+        return sum(ep(i) for i in ids)
+
+    def describe(pid: int) -> str:
+        if pid not in by_id.index:
+            return f"id {pid} (not in feed)"
+        r = by_id.loc[pid]
+        return f"{r['name']} ({r['squadName']}, {r['position']}, {r['ep_match']:.1f} EP)"
+
+    gap = ep_sum(ideal_ids) - ep_sum(current)
+    lines = [
+        f"You already own {len(overlap)}/{rules.SQUAD_SIZE} of the ideal squad.",
+        f"Ideal EP/round {ep_sum(ideal_ids):.1f} vs yours {ep_sum(current):.1f} "
+        f"(gap {gap:+.1f} pts this round).",
+    ]
+    add = sorted(ideal_ids - current, key=ep, reverse=True)
+    drop = sorted(current - ideal_ids, key=ep)
+    if add:
+        lines.append("Upgrades the ideal would bring IN (you don't own):")
+        lines += [f"   + {describe(i)}" for i in add]
+    if drop:
+        lines.append("Players of yours the ideal would drop:")
+        lines += [f"   - {describe(i)}" for i in drop]
+    if not add and not drop:
+        lines.append("Your squad already IS the ideal for this round.")
+    return lines
+
+
+def run(from_scratch: bool = False) -> None:
     console.print("[bold]Refreshing FIFA feeds...[/bold]")
     changed = fifa_client.refresh()
     player_points.apply_calibration()
@@ -193,10 +232,24 @@ def run() -> None:
 
     team = state.load()
     carried_next = 0
-    if not team.player_ids:
-        console.print("[bold]No saved team: building the initial squad.[/bold]")
+    # Ideal-squad view: build from scratch even with a team saved, to show
+    # how far the unconstrained optimum is from the current squad. It is a
+    # reference, never written to last_advice (you cannot rebuild freely
+    # without the Wildcard), so `team apply` is not offered for it.
+    comparison_mode = from_scratch and bool(team.player_ids)
+    if from_scratch or not team.player_ids:
+        if comparison_mode:
+            console.print(
+                "[bold]Ideal-squad view[/bold]: optimal 15 from scratch, ignoring "
+                "your saved team and the transfer limits (a target, not an "
+                "applyable plan)."
+            )
+        else:
+            console.print("[bold]No saved team: building the initial squad.[/bold]")
         solution = build_squad(df, budget=budget, max_per_squad=country_cap)
-        moves: list[str] = ["Create your team with the 15 players below."]
+        moves: list[str] = (
+            [] if comparison_mode else ["Create your team with the 15 players below."]
+        )
     else:
         plan = transfers_mod.plan_transfers(
             df, team, budget, next_round=rnd, max_per_squad=country_cap
@@ -231,6 +284,11 @@ def run() -> None:
                 f"Note: {plan.carried_next} unused transfer carries over to round 3."
             )
 
+    # Option-value tweak: among near-equal top starters, captain whoever
+    # plays earliest (the armband is switchable live to a not-yet-played
+    # contender, never the reverse). captain_timing_note explains it below.
+    solution.captain_id = captain_mod.captain_by_timing(df, solution, rounds, rnd)
+
     console.print(_squad_table(df, solution))
     console.print(f"\nTotal cost: ${solution.cost:.1f}m "
                   f"(${budget - solution.cost:.1f}m left)")
@@ -246,10 +304,16 @@ def run() -> None:
                 f"likely to play"
             )
 
-    console.print("\n[bold]Moves to execute in the game:[/bold]")
+    if comparison_mode:
+        console.print("\n[bold]Your squad vs the ideal:[/bold]")
+        for line in squad_comparison(df, solution, team.player_ids):
+            console.print(f"  - {line}")
+
+    names = df.set_index("id")["name"]
+    header = "Ideal lineup (reference):" if comparison_mode else "Moves to execute in the game:"
+    console.print(f"\n[bold]{header}[/bold]")
     for m in moves:
         console.print(f"  - {m}")
-    names = df.set_index("id")["name"]
     console.print(f"  - Captain: [bold]{names[solution.captain_id]}[/bold]")
     vice_id = captain_mod.vice_captain(df, solution)
     console.print(f"  - Vice-captain: [bold]{names[vice_id]}[/bold]")
@@ -259,6 +323,13 @@ def run() -> None:
     bench_order, bench_gk = captain_mod.ordered_bench(df, solution)
     subs = ", ".join(f"{k+1}) {names[i]}" for k, i in enumerate(bench_order))
     console.print(f"  - Bench order: {subs} | GK: {names[bench_gk]}")
+
+    if comparison_mode:
+        console.print(
+            "\nReference only: not saved. Run [bold]python -m wcfantasy advise[/bold] "
+            "(no flag) for the applyable plan within your transfer limits."
+        )
+        return
 
     for tip in captain_mod.booster_advice(df, team, solution, rnd):
         console.print(f"  - Booster: {tip}")

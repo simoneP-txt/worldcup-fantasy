@@ -50,6 +50,27 @@ def test_parse_lineup_factors_starter_bench_and_omitted():
     assert 5 not in factors                        # Mexico not in this match
 
 
+def test_parse_lineup_factors_does_not_false_out_on_a_name_miss():
+    # A published starter whose name does not bridge (spelling/format drift)
+    # leaves the side unresolved: keep the positive signals, but NEVER rule
+    # out the squad members we could not place (no false 0.0 on a real
+    # starter). Here Embolo is published but garbled.
+    match = {
+        "HomeTeam": {
+            "IdCountry": "SUI",
+            "Players": [
+                _player("a", "Ruben Vargas", fifa_match.STARTER_STATUS),
+                _player("b", "Zzz Unbridgeable", fifa_match.STARTER_STATUS),
+            ],
+        },
+        "AwayTeam": {"IdCountry": "USA", "Players": []},
+    }
+    factors = fifa_match.parse_lineup_factors(match, SQUADS, _players())
+    assert factors[1] == 1.0   # Vargas still recognised as a starter
+    assert 2 not in factors    # Xhaka not zeroed despite being absent here
+    assert 3 not in factors    # Embolo not zeroed: the parse is not trusted
+
+
 # --------------------------------------------------------------- bookings
 
 def test_classify_bookings_yellows_reds_and_double_yellow():

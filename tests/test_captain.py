@@ -1,7 +1,9 @@
 import pandas as pd
 
 from wcfantasy.optimizer.captain import (
+    _progressing_starters,
     booster_advice,
+    captain_by_timing,
     captain_timing_note,
     planned_activation,
 )
@@ -55,6 +57,44 @@ def test_silent_when_the_gap_is_clear():
     df = _df(runner_ep=3.0)  # no contender close to the captain
     note = captain_timing_note(df, _solution(1, df), ROUNDS, 1)
     assert note is None
+
+
+# ----------------------------------------------------- captain by kickoff order
+
+def test_captain_by_timing_prefers_earlier_kickoff_among_near_equals():
+    # Early Star (id 1, plays 11 Jun) vs Late Star (id 2, 13 Jun), within
+    # tolerance. The ILP captained the late one; timing moves it to the early.
+    df = _df(runner_ep=6.8)
+    assert captain_by_timing(df, _solution(2, df), ROUNDS, 1) == 1
+
+
+def test_captain_by_timing_keeps_ilp_pick_without_a_near_equal_contender():
+    df = _df(runner_ep=3.0)  # only the early star is a contender
+    assert captain_by_timing(df, _solution(1, df), ROUNDS, 1) == 1
+
+
+def test_captain_by_timing_does_not_downgrade_a_clear_best():
+    # Late Star is clearly the best and below-tolerance Early Star must not
+    # steal the armband just because he plays first.
+    df = _df(runner_ep=10.0)
+    assert captain_by_timing(df, _solution(2, df), ROUNDS, 1) == 2
+
+
+# ----------------------------------------------------- progressing starters
+
+def test_progressing_starters_uses_p_advance_when_present():
+    # P(win next match) > 0.5 is the signal; next_round is irrelevant here.
+    starters = pd.DataFrame({
+        "p_advance": [0.60, 0.55, 0.40, 0.51],
+        "future_rounds": [0.0, 0.0, 0.0, 0.0],
+    })
+    assert _progressing_starters(starters, next_round=7) == 3
+
+
+def test_progressing_starters_falls_back_to_future_rounds():
+    # No p_advance column: old heuristic, SF threshold 8 - 7 + 0.5 = 1.5.
+    starters = pd.DataFrame({"future_rounds": [2.0, 1.0, 1.6]})
+    assert _progressing_starters(starters, next_round=7) == 2
 
 
 # ------------------------------------------------------------ booster advice

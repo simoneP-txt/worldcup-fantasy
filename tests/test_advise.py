@@ -1,7 +1,7 @@
 import pandas as pd
 
 from wcfantasy import advise, state
-from wcfantasy.advise import fixture_schedule, next_round_number
+from wcfantasy.advise import fixture_schedule, next_round_number, squad_comparison
 from wcfantasy.optimizer.squad import SquadSolution
 
 
@@ -48,6 +48,31 @@ def test_fixture_schedule_filters_sorts_and_converts_to_italian_time():
     assert "Yamal (C)" in lines[0] and "Raya" in lines[0]
     assert lines[1].startswith("Sat 13 Jun 03:00")
     assert "Mbappe (V)" in lines[1]
+
+
+def test_squad_comparison_overlap_gap_add_and_drop():
+    df = pd.DataFrame([
+        {"id": 1, "name": "A", "squadName": "T1", "position": "GK", "ep_match": 4.0},
+        {"id": 2, "name": "B", "squadName": "T2", "position": "DEF", "ep_match": 5.0},
+        {"id": 3, "name": "C", "squadName": "T3", "position": "MID", "ep_match": 6.0},
+        {"id": 4, "name": "D", "squadName": "T4", "position": "FWD", "ep_match": 2.0},
+    ])
+    ideal = SquadSolution([1, 2, 3], [1, 2, 3], 3, 0.0, 0.0)
+    lines = squad_comparison(df, ideal, current_ids=[1, 2, 4])
+    text = " ".join(lines)
+    assert "own 2/15" in text                       # overlap {1, 2}
+    assert "gap +4.0" in text                        # 15 ideal - 11 current
+    assert any(l.strip().startswith("+ C") for l in lines)  # bring in C
+    assert any(l.strip().startswith("- D") for l in lines)  # drop D
+
+
+def test_squad_comparison_handles_id_missing_from_feed():
+    df = pd.DataFrame([
+        {"id": 1, "name": "A", "squadName": "T1", "position": "GK", "ep_match": 4.0},
+    ])
+    ideal = SquadSolution([1], [1], 1, 0.0, 0.0)
+    lines = squad_comparison(df, ideal, current_ids=[1, 999])  # 999 not in feed
+    assert any("999" in l and "not in feed" in l for l in lines)
 
 
 def test_use_booster_records_dedups_and_rejects_unknown(monkeypatch, tmp_path):
