@@ -213,6 +213,23 @@ def test_nudge_ratings_is_clamped():
     assert big[1] - 1500.0 == pytest.approx(progression.ODDS_NUDGE_MAX)
 
 
+def test_championship_probabilities_reads_the_stashed_champion(monkeypatch):
+    def fake(squads, rounds, n_sims, seed):
+        progression.last_run_info["champion"] = {1: 0.6, 2: 0.4}
+        return "curve"  # the curve is ignored by championship_probabilities
+
+    monkeypatch.setattr(progression, "_simulate_with_market", fake)
+    assert progression.championship_probabilities([], []) == {1: 0.6, 2: 0.4}
+
+
+def test_championship_probabilities_empty_when_simulation_fails(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("no history")
+
+    monkeypatch.setattr(progression, "_simulate_with_market", boom)
+    assert progression.championship_probabilities([], []) == {}
+
+
 def test_bracket_file_is_well_formed():
     bracket = json.loads(progression._BRACKET_FILE.read_text(encoding="utf-8"))
     template = bracket["template"]

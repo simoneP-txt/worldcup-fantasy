@@ -12,7 +12,7 @@ from rich.table import Table
 
 from . import feed_status, features, fifa_client, fixtures, rules, state
 from .config import STATE_DIR
-from .data_sources import availability
+from .data_sources import availability, odds
 from .models import player_points, progression
 from .optimizer import captain as captain_mod
 from .optimizer import transfers as transfers_mod
@@ -124,6 +124,54 @@ def _squad_table(df, solution: SquadSolution) -> Table:
             role,
         )
     return table
+
+
+def _unverified_starter_watch(df, solution: SquadSolution) -> None:
+    """Warn about starters whose status is a PRICE guess, not observed minutes.
+
+    The game's price ranked the wrong keeper for several teams, so a starter
+    we have neither watched play (observed_start_ids) nor pinned by hand
+    (starter_overrides.json) is flagged. GKs are always listed by name (the
+    acute case); before any match the whole XI is a guess, so the outfield is
+    collapsed to a count to avoid an 11-line wall."""
+    observed_ids = player_points.last_run_info.get("observed_start_ids", set())
+    override_names: set = set()
+    if player_points.STARTER_OVERRIDES_FILE.exists():
+        try:
+            override_names = set(json.loads(
+                player_points.STARTER_OVERRIDES_FILE.read_text(encoding="utf-8")
+            ))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    starters = df[df["id"].isin(solution.starter_ids)]
+    price_only = starters[
+        ~starters["id"].isin(observed_ids) & ~starters["name"].isin(override_names)
+    ]
+    if price_only.empty:
+        return
+
+    console.print(
+        "\n[bold]Starter status UNVERIFIED (price guess, not observed minutes):[/bold]"
+    )
+    for _, r in price_only[price_only["position"] == "GK"].iterrows():
+        console.print(
+            f"  - GK {r['name']} ({r['squadName']}): price barely separates "
+            "keepers — VERIFY he is the #1 before lockout."
+        )
+    outfield = price_only[price_only["position"] != "GK"]
+    if len(price_only) > 6:
+        console.print(
+            f"  - Plus {len(outfield)} outfield starters: no WC minutes played "
+            "yet, so the whole XI is a price-based guess this round."
+        )
+    else:
+        for _, r in outfield.iterrows():
+            console.print(f"  - {r['name']} ({r['squadName']}, {r['position']})")
+    console.print(
+        "  Force a known case via data/external/starter_overrides.json "
+        '(e.g. {"Player Name": 0.0} to bench, 0.9 to start).'
+    )
 
 
 def squad_comparison(df, ideal: SquadSolution, current_ids: list[int]) -> list[str]:
@@ -304,6 +352,8 @@ def run(from_scratch: bool = False) -> None:
                 f"likely to play"
             )
 
+    _unverified_starter_watch(df, solution)
+
     if comparison_mode:
         console.print("\n[bold]Your squad vs the ideal:[/bold]")
         for line in squad_comparison(df, solution, team.player_ids):
@@ -455,3 +505,56 @@ def show_team() -> None:
         console.print(f"Carried-over transfers: {team.transfers_carried}")
     if team.boosters_used:
         console.print(f"Boosters used: {', '.join(team.boosters_used)}")
+
+
+def show_odds() -> None:
+    """Print the model's championship probability for every team.
+
+    Runs the same Monte Carlo as `advise` (market-calibrated when odds are
+    available) and lists each team's P(win), the fair decimal odds (1/p)
+    and, when a bookmaker key is set, the market's implied probability for
+    comparison. Refreshes the feeds first so the numbers reflect the last
+    played match.
+    """
+    console.print("[bold]Refreshing FIFA feeds...[/bold]")
+    fifa_client.refresh()
+    rounds = fifa_client.load("rounds")
+    squads = fifa_client.load("squads")
+    console.print(fifa_client.freshness_report(rounds))
+
+    champ = progression.championship_probabilities(squads, rounds)
+    if not champ:
+        console.print(
+            "Championship odds unavailable: the Monte Carlo model could not "
+            "run (check the historical-results download / network)."
+        )
+        return
+
+    market = {}
+    try:
+        market = odds.outright_probabilities(squads) or {}
+    except Exception:
+        pass
+
+    names = {s["id"]: s["name"] for s in squads}
+    console.print(f"Model: {progression.last_run_info.get('model', '?')}\n")
+    table = Table(title="Championship odds (your model)")
+    table.add_column("Team")
+    table.add_column("P(win)", justify="right")
+    table.add_column("Fair odds", justify="right")
+    table.add_column("Market", justify="right")
+    for sid, p in sorted(champ.items(), key=lambda kv: kv[1], reverse=True):
+        if p <= 0:
+            continue
+        m = market.get(sid)
+        table.add_row(
+            names.get(sid, str(sid)),
+            f"{p * 100:.1f}%",
+            f"{1 / p:.1f}",
+            f"{m * 100:.1f}%" if m else "-",
+        )
+    console.print(table)
+    if not market:
+        console.print(
+            "\n(Market column off: set ODDS_API_KEY for the bookmaker comparison.)"
+        )

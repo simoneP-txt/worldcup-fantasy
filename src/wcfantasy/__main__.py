@@ -20,6 +20,9 @@ def main() -> None:
         "reference only, not saved",
     )
     sub.add_parser("fetch", help="refresh FIFA data only")
+    sub.add_parser(
+        "odds", help="model championship probability (P win) for each team"
+    )
 
     live_p = sub.add_parser(
         "live", help="intra-round advice: captain switches and manual subs"
@@ -61,6 +64,8 @@ def main() -> None:
     elif args.command == "fetch":
         changed = fifa_client.refresh()
         print({k: ("updated" if v else "unchanged") for k, v in changed.items()})
+    elif args.command == "odds":
+        advise.show_odds()
     elif args.command == "live":
         live.run(mark_changed=args.mark_changed)
     elif args.command == "calibrate":

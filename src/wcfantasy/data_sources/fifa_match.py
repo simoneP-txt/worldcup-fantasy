@@ -72,6 +72,15 @@ SAME_MATCH_YELLOWS_FOR_RED = 2
 
 CALENDAR_CACHE = EXTERNAL_DIR / "fifa_calendar.json"
 
+# Observed starts (who actually took the pitch in completed matches) are the
+# real depth-chart signal - the game's price is near-flat for GKs and ranked
+# the wrong keeper for Spain and Egypt at matchday 1. A more recent match
+# weighs more (decay per round back); the estimate is clamped so one outing
+# is strong evidence but never a literal certainty (managers rotate).
+OBSERVED_RECENCY_DECAY = 0.6
+OBSERVED_START_FLOOR = 0.05
+OBSERVED_START_CEILING = 0.95
+
 last_run_info: dict = {}
 
 
@@ -103,26 +112,44 @@ def _fetch_calendar() -> list | None:
         return None
 
 
+def _has_lineup(detail: dict) -> bool:
+    """True if at least one side carries a non-empty Players list.
+
+    A match detail fetched BEFORE the lineup is published has empty Players
+    on both sides; such a payload is useless and, if it was ever cached for
+    a since-completed match, poisons every later read. Used to refuse both
+    caching and trusting a lineup-less payload.
+    """
+    return any((detail.get(side) or {}).get("Players") for side in ("HomeTeam", "AwayTeam"))
+
+
 def _fetch_match(id_stage, id_match, *, cache: bool = True) -> dict | None:
     """One match detail (Players + Bookings).
 
-    `cache=True` (suspensions path) keeps a permanent on-disk copy: a
-    COMPLETED match is immutable once played. `cache=False` (the lineups
-    path for a not-yet-finished match) always refetches and never writes,
-    because the pre-match detail mutates as the confirmed XI is published
-    ~1h before kickoff - caching an early, lineup-less payload would hide
-    the lineup from every later `live` run.
+    `cache=True` (suspensions / observed-starts paths) keeps a permanent
+    on-disk copy: a COMPLETED match is immutable once played. `cache=False`
+    (the lineups path for a not-yet-finished match) always refetches and
+    never writes, because the pre-match detail mutates as the confirmed XI
+    is published ~1h before kickoff.
+
+    Only payloads that actually carry a lineup are cached, and a cached but
+    lineup-less payload is treated as a miss and refetched. This both
+    prevents poisoning the cache with an early empty fetch and self-heals
+    files already poisoned by the previous always-cache behaviour.
     """
     cache_file = _match_cache(id_match)
     if cache and cache_file.exists():
-        return json.loads(cache_file.read_text(encoding="utf-8"))
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        if _has_lineup(cached):
+            return cached
+        # poisoned/empty cache (fetched before the lineup was out): refetch.
     try:
         data = fifa_client.fifa_api_get(
             f"/live/football/{WC_COMPETITION_ID}/{WC_SEASON_ID}/{id_stage}/{id_match}",
             language="en",
         )
         if isinstance(data, dict):
-            if cache:
+            if cache and _has_lineup(data):
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
                 cache_file.write_text(json.dumps(data), encoding="utf-8")
             return data
@@ -211,6 +238,61 @@ def parse_lineup_factors(
                 if int(pid) not in resolved:
                     factors[int(pid)] = 0.0
     return factors
+
+
+# ----------------------------------------------------- pure: observed starts
+
+def parse_started(
+    match: dict, squads: list[dict], players: pd.DataFrame
+) -> dict[int, bool]:
+    """{fantasy id -> started?} from one COMPLETED match detail.
+
+    Status 1 = started (True), Status 2 = bench/unused (False). A squad
+    member not on the published list is omitted (no observation). Pure,
+    unit-tested. Same exact-team + fuzzy-name bridge as the rest of the
+    module. This is the observed depth chart that replaces the price rank.
+    """
+    by_abbr = abbr_to_squad(squads)
+    by_squad = squad_roster(players)
+    out: dict[int, bool] = {}
+    for side in ("HomeTeam", "AwayTeam"):
+        block = match.get(side) or {}
+        squad_players = block.get("Players") or []
+        if not squad_players:
+            continue
+        sid = by_abbr.get(block.get("IdCountry"))
+        if sid is None or sid not in by_squad:
+            continue
+        roster = by_squad[sid]
+        roster_names = [n for n, _ in roster]
+        id_of = {n: int(i) for n, i in roster}
+        for p in squad_players:
+            status = p.get("Status")
+            if status not in (STARTER_STATUS, BENCH_STATUS):
+                continue
+            matched = match_name(
+                _team_name(p.get("PlayerName")), roster_names, cutoff=0.82
+            )
+            if matched is not None:
+                out[id_of[matched]] = status == STARTER_STATUS
+    return out
+
+
+def recency_weighted_start_rate(observations: list[tuple[int, bool]]) -> float:
+    """P(start next) from [(round, started?)] - most recent weighs most.
+
+    Pure, unit-tested. Clamped to [FLOOR, CEILING]: one start is strong but
+    not a certainty, one benching is a warning but not a guarantee of exile.
+    """
+    ordered = sorted(observations, key=lambda t: t[0], reverse=True)
+    num = den = 0.0
+    for i, (_, started) in enumerate(ordered):
+        w = OBSERVED_RECENCY_DECAY**i
+        num += w * (1.0 if started else 0.0)
+        den += w
+    if den == 0:
+        return OBSERVED_START_FLOOR
+    return min(OBSERVED_START_CEILING, max(OBSERVED_START_FLOOR, num / den))
 
 
 # ------------------------------------------------------- pure: suspensions
@@ -438,4 +520,45 @@ def suspension_factors(
     )
     factors = resolve_to_fantasy(banned, id_names, squads, players)
     last_run_info.update(suspensions=len(factors), reachable=True)
+    return factors
+
+
+def observed_start_factors(
+    rounds: list[dict], target_round: int, squads: list[dict], players: pd.DataFrame
+) -> dict[int, float]:
+    """{fantasy id -> P(starts)} learned from who actually played.
+
+    Reads the lineups of every completed match before `target_round` from
+    the FIFA Match Centre and turns each player's start history into a
+    recency-weighted probability. This is the data-driven depth chart that
+    supersedes the game's price rank (which mis-ranked the Spain and Egypt
+    keepers): a player who started recent matches reads high, one benched
+    while fit reads low. {} when the feed is unreachable or no match has
+    been played, so the caller falls back to the price prior.
+    """
+    calendar = _fetch_calendar()
+    if not calendar:
+        last_run_info.update(observed_players=0, reachable=False)
+        return {}
+
+    round_of = _round_index(rounds, squads)
+    history: dict[int, list[tuple[int, bool]]] = defaultdict(list)
+    for m in calendar:
+        if m.get("MatchStatus") != MATCH_COMPLETED:
+            continue
+        h = (m.get("Home") or {}).get("IdCountry")
+        a = (m.get("Away") or {}).get("IdCountry")
+        rno = round_of.get((h, a)) or round_of.get((a, h))
+        if rno is None or rno >= target_round:
+            continue
+        detail = _fetch_match(m.get("IdStage"), m.get("IdMatch"))
+        if not detail:
+            continue
+        for pid, started in parse_started(detail, squads, players).items():
+            history[pid].append((rno, started))
+
+    factors = {
+        int(pid): recency_weighted_start_rate(obs) for pid, obs in history.items()
+    }
+    last_run_info.update(observed_players=len(factors), reachable=True)
     return factors

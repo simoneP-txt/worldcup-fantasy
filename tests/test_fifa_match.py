@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from wcfantasy.data_sources import fifa_match
 
@@ -69,6 +70,37 @@ def test_parse_lineup_factors_does_not_false_out_on_a_name_miss():
     assert factors[1] == 1.0   # Vargas still recognised as a starter
     assert 2 not in factors    # Xhaka not zeroed despite being absent here
     assert 3 not in factors    # Embolo not zeroed: the parse is not trusted
+
+
+# ----------------------------------------------------- observed starts
+
+def test_parse_started_marks_starters_and_bench():
+    match = {
+        "HomeTeam": {
+            "IdCountry": "SUI",
+            "Players": [
+                _player("a", "Ruben Vargas", fifa_match.STARTER_STATUS),
+                _player("b", "Granit Xhaka", fifa_match.BENCH_STATUS),
+            ],
+        },
+        "AwayTeam": {"IdCountry": "USA", "Players": []},
+    }
+    started = fifa_match.parse_started(match, SQUADS, _players())
+    assert started[1] is True    # Vargas started
+    assert started[2] is False   # Xhaka on the bench
+    assert 3 not in started      # Embolo not listed -> no observation
+    assert 4 not in started      # USA lineup empty
+
+
+def test_recency_weighted_start_rate_clamps_and_weights_recency():
+    assert fifa_match.recency_weighted_start_rate([(1, True)]) == fifa_match.OBSERVED_START_CEILING
+    assert fifa_match.recency_weighted_start_rate([(1, False)]) == fifa_match.OBSERVED_START_FLOOR
+    assert fifa_match.recency_weighted_start_rate([]) == fifa_match.OBSERVED_START_FLOOR
+    # a recent start outweighs an older benching
+    p = fifa_match.recency_weighted_start_rate([(2, True), (1, False)])
+    assert p == pytest.approx(1.0 / (1.0 + fifa_match.OBSERVED_RECENCY_DECAY))
+    # input order does not matter (sorted by round internally)
+    assert fifa_match.recency_weighted_start_rate([(1, False), (2, True)]) == pytest.approx(p)
 
 
 # --------------------------------------------------------------- bookings

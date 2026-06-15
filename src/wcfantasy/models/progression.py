@@ -216,9 +216,11 @@ def _simulate_with_market(squads, rounds, n_sims, seed):
 
     if outright:
         nudged = nudge_ratings(rating, outright, champion)
-        curve, _ = _simulate(squads, rounds, nudged, probs_fn, h2h, n_sims, seed)
+        curve, champion = _simulate(squads, rounds, nudged, probs_fn, h2h, n_sims, seed)
         last_run_info["model"] = "Elo + economics + market calibration"
         last_run_info["ratings"] = nudged
+    # P(wins the tournament) per squadId, for the `odds` command.
+    last_run_info["champion"] = champion
     return curve
 
 
@@ -426,3 +428,25 @@ def expected_future_rounds(
 ) -> pd.Series:
     """Sum of P(still playing) over rounds >= next_round, per squadId."""
     return future_rounds_from_curve(survival_curve(players, squads, rounds), next_round)
+
+
+def championship_probabilities(
+    squads: list[dict],
+    rounds: list[dict],
+    n_sims: int = N_SIMS,
+    seed: int | None = 42,
+) -> dict[int, float]:
+    """{squadId -> P(wins the tournament)} from the Monte Carlo.
+
+    Market-calibrated when bookmaker outright odds are available (the same
+    model `advise` uses). Returns {} if the simulation cannot run (e.g. the
+    historical results are unavailable offline), so the caller degrades
+    cleanly instead of crashing. Read `last_run_info['model']` for which
+    model produced the numbers.
+    """
+    try:
+        _simulate_with_market(squads, rounds, n_sims, seed)
+    except Exception:
+        log.exception("championship simulation failed")
+        return {}
+    return dict(last_run_info.get("champion", {}))

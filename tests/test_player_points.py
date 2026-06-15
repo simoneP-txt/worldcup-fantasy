@@ -122,6 +122,21 @@ def test_ruled_out_player_collapses_to_almost_zero():
     assert out.iloc[0] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_observed_starts_override_price_rank():
+    # the price #1 GK (more expensive + more owned) did NOT play; the cheaper
+    # keeper started. Observed minutes must flip the depth chart.
+    rows = [
+        _players(30.0) | {"price": 5.0, "position": "GK", "id": 1},  # price #1
+        _players(5.0) | {"price": 4.5, "position": "GK", "id": 2},   # cheaper
+    ]
+    df = pd.DataFrame(rows)
+    base = starter_probability(df)                       # price rank only
+    assert base.iloc[0] > base.iloc[1]                   # price favours #1
+    out = starter_probability(df, observed_starts={1: 0.05, 2: 0.95})
+    assert out.iloc[0] == pytest.approx(0.05)            # observed bench
+    assert out.iloc[1] == pytest.approx(0.95)            # observed starter
+
+
 def test_backup_keeper_never_outranks_the_number_one():
     # Joan Garcia scenario: a 3rd-choice keeper with a stellar club
     # season must stay far below the actual #1 of the same nation.

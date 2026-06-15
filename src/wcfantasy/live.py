@@ -322,6 +322,7 @@ def round_outlook(
     phases: dict[int, str],
     availability: dict[int, float] | None,
     kickoffs: dict[int, datetime] | None = None,
+    observed_starts: dict[int, float] | None = None,
 ) -> list[str]:
     """One line per MY player whose match is still to come this round:
     how likely he is to take the pitch (P plays = depth chart x
@@ -329,7 +330,7 @@ def round_outlook(
     transfers, the captain/sub advice above): here we only flag who might
     not play."""
     by_id = df.set_index("id")
-    p_play = player_points.starter_probability(df, availability)
+    p_play = player_points.starter_probability(df, availability, observed_starts)
     p_play.index = df["id"]
 
     rows = []
@@ -412,11 +413,12 @@ def run(mark_changed: bool = False) -> None:
     injuries = availability_mod.availability_factors(squads, df, rounds, round_no)
     lineups = availability_mod.live_lineup_factors(rnd, squads, df)
     availability = {**injuries, **lineups}
-    # Same EP basis as advise: blend in the club-stats prior, not the
-    # price prior alone, so a borderline captain/sub call matches.
+    # Same EP basis as advise: club-stats prior + the observed-starts depth
+    # chart (who actually played the completed matches), not the price rank.
+    observed = availability_mod.observed_start_factors(rounds, round_no, squads, df)
     club_ep = player_points.club_prior(df)
     df["ep_match"] = player_points.expected_points_per_match(
-        df, club_ep, availability=availability
+        df, club_ep, availability=availability, observed_starts=observed
     )
     points = {
         p["id"]: player_round_points(p.get("stats"), round_no) for p in players_raw
@@ -445,7 +447,7 @@ def run(mark_changed: bool = False) -> None:
     for line in subs or ["No substitution worth making right now."]:
         console.print(f"  - {line}")
 
-    outlook = round_outlook(df, team, phases, availability, kickoffs)
+    outlook = round_outlook(df, team, phases, availability, kickoffs, observed)
     console.print("\n[bold]Still to play this round (P plays):[/bold]")
     for line in outlook or ["All your players have already played this round."]:
         console.print(f"  - {line}")

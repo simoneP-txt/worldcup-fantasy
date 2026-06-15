@@ -75,6 +75,23 @@ def test_squad_comparison_handles_id_missing_from_feed():
     assert any("999" in l and "not in feed" in l for l in lines)
 
 
+def test_unverified_starter_watch_flags_price_only_gk(capsys, monkeypatch, tmp_path):
+    from wcfantasy.models import player_points
+
+    # GK has no observed minutes and no override -> flagged; the MID does
+    monkeypatch.setattr(player_points, "STARTER_OVERRIDES_FILE", tmp_path / "none.json")
+    player_points.last_run_info["observed_start_ids"] = {2}
+    df = pd.DataFrame([
+        {"id": 1, "name": "Keeper One", "squadName": "T1", "position": "GK"},
+        {"id": 2, "name": "Mid One", "squadName": "T2", "position": "MID"},
+    ])
+    sol = SquadSolution([1, 2], [1, 2], 1, 0.0, 0.0)
+    advise._unverified_starter_watch(df, sol)
+    out = capsys.readouterr().out
+    assert "Keeper One" in out and "VERIFY" in out
+    assert "Mid One" not in out  # observed start -> not flagged
+
+
 def test_use_booster_records_dedups_and_rejects_unknown(monkeypatch, tmp_path):
     monkeypatch.setattr(state, "MY_TEAM_FILE", tmp_path / "my_team.json")
     advise.use_booster("wildcard")

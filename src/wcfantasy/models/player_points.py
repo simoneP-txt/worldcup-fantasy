@@ -127,15 +127,21 @@ def price_prior(players: pd.DataFrame) -> pd.Series:
 
 
 def starter_probability(
-    players: pd.DataFrame, availability: dict[int, float] | None = None
+    players: pd.DataFrame,
+    availability: dict[int, float] | None = None,
+    observed_starts: dict[int, float] | None = None,
 ) -> pd.Series:
     """P(player plays for his national team) in [0, 1].
 
-    Depth chart from the game's own prices (within (squad, position) the
-    experts price expected starters above backups; percentSelected
-    breaks ties) times an availability factor from injuries / confirmed
-    lineups. starter_overrides.json still wins over the inference for
-    manual depth-chart corrections.
+    Depth chart, strongest signal last:
+    1. the game's price rank within (squad, position) - a WEAK pre-tournament
+       prior (it is near-flat for GKs and ranked the wrong keeper for Spain
+       and Egypt, so it must never be the final word once data exists);
+    2. `observed_starts` (who actually played the completed matches, from the
+       FIFA Match Centre) overrides the price rank wherever we have it;
+    3. starter_overrides.json (a deliberate manual correction) wins over both.
+    The result is then scaled by an availability factor (injuries / confirmed
+    lineups). Absent id = assumed fit (1.0).
     """
     key = players["price"] + players["percentSelected"] / 1000.0
     rank = key.groupby([players["squadId"], players["position"]]).rank(
@@ -153,6 +159,12 @@ def starter_probability(
         [lookup(p, r) for p, r in zip(players["position"], rank)],
         index=players.index,
     )
+
+    # Observed minutes beat the market prior: real starts reveal the true
+    # depth chart the price only guesses at.
+    if observed_starts and "id" in players.columns:
+        observed = players["id"].map(observed_starts)
+        out = observed.fillna(out)
 
     if STARTER_OVERRIDES_FILE.exists() and "name" in players.columns:
         overrides = json.loads(STARTER_OVERRIDES_FILE.read_text(encoding="utf-8"))
@@ -233,18 +245,19 @@ def expected_points_per_match(
     players: pd.DataFrame,
     club_ep: pd.Series | None = None,
     availability: dict[int, float] | None = None,
+    observed_starts: dict[int, float] | None = None,
 ) -> pd.Series:
     prior = price_prior(players)
     if club_ep is not None:
         w = WEIGHTS["club_prior_weight"]
         blended = w * club_ep + (1 - w) * prior
         prior = blended.fillna(prior)
-    # Depth-chart starter prob scales the prior and IS overridden by
-    # observed form: real minutes reveal the true lineup, so a "backup"
-    # who keeps playing earns full value. The injury / availability factor
-    # is separate (applied to the final EP below), because an injury is
-    # fresh news that past form must NOT override.
-    prior = prior * starter_probability(players, None)
+    # Depth-chart starter prob scales the prior. The price rank is only a
+    # weak prior; `observed_starts` (who actually played) supersedes it, and
+    # observed form takes over the quality side separately below. The injury
+    # / availability factor is applied to the final EP (not here), because an
+    # injury is fresh news that past form must NOT override.
+    prior = prior * starter_probability(players, None, observed_starts)
 
     full = WEIGHTS["matches_for_full_form"]
     played = players["matchesPlayed"].clip(upper=full)
@@ -325,7 +338,13 @@ def expected_value(
     availability = availability_mod.availability_factors(
         squads, players, rounds, next_round
     )
-    base = expected_points_per_match(players, club_ep, availability)
+    # Observed starts (who actually played the completed matches) supersede
+    # the price depth chart in starter_probability. {} before any match.
+    observed = availability_mod.observed_start_factors(
+        rounds, next_round, squads, players
+    )
+    last_run_info["observed_start_ids"] = set(observed)
+    base = expected_points_per_match(players, club_ep, availability, observed)
     out["ep_match"] = base * opponent_factor(players, rounds, next_round, ratings)
     out["future_rounds"] = out["squadId"].map(future).fillna(0.0)
     # P(team wins its next match), for the Qualification booster (advancing
@@ -334,5 +353,5 @@ def expected_value(
     out["ep_horizon"] = base * out["future_rounds"]
     # P(plays) for the report: depth chart x availability. The depth-chart
     # part scaled the prior; the availability part scaled the final EP.
-    out["p_play"] = starter_probability(players, availability)
+    out["p_play"] = starter_probability(players, availability, observed)
     return out

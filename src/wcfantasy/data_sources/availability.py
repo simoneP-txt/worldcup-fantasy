@@ -206,3 +206,15 @@ def live_lineup_factors(
     unreachable, so the caller falls back to the other signals.
     """
     return fifa_match.lineup_factors(rnd, squads, players)
+
+
+def observed_start_factors(
+    rounds: list[dict], target_round: int, squads: list[dict], players: pd.DataFrame
+) -> dict[int, float]:
+    """{fantasy id -> P(starts)} from who actually played the completed
+    matches (FIFA Match Centre). This is the data-driven depth chart that
+    supersedes the game's price rank in the player-points model. {} when the
+    feed is unreachable or nothing has been played yet, so the caller falls
+    back to the price prior. Delegates to fifa_match; same clean-degrade
+    contract as the other signals here."""
+    return fifa_match.observed_start_factors(rounds, target_round, squads, players)
