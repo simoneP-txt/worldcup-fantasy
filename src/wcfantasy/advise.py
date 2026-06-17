@@ -332,10 +332,12 @@ def run(from_scratch: bool = False) -> None:
                 f"Note: {plan.carried_next} unused transfer carries over to round 3."
             )
 
-    # Option-value tweak: among near-equal top starters, captain whoever
-    # plays earliest (the armband is switchable live to a not-yet-played
-    # contender, never the reverse). captain_timing_note explains it below.
-    solution.captain_id = captain_mod.captain_by_timing(df, solution, rounds, rnd)
+    # Option-value captaincy: the armband is switchable live (completed ->
+    # not-yet-played), so captaining the EARLIEST strong starter first and
+    # rolling it to a later, higher-EP one if he disappoints banks the better
+    # of the two - worth more than captaining the top-EP starter outright even
+    # at a meaningful EP gap. captain_timing_note explains it below.
+    solution.captain_id = captain_mod.recommend_captain(df, solution, rounds, rnd).initial
 
     console.print(_squad_table(df, solution))
     console.print(f"\nTotal cost: ${solution.cost:.1f}m "

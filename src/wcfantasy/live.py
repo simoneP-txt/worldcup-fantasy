@@ -21,12 +21,14 @@ stats.roundPoints is a dict keyed by round number as string, e.g.
 """
 
 from datetime import datetime, timedelta, timezone
+from difflib import get_close_matches
 
 from rich.console import Console
 
 from . import feed_status, features, fifa_client, fixtures, rules, state
 from .data_sources import availability as availability_mod
 from .models import player_points
+from .optimizer import captain as captain_mod
 
 console = Console()
 
@@ -180,6 +182,72 @@ def first_change_cost(team: state.TeamState, df, phases: dict[int, str]) -> floa
     return len(pending) * DNP_PROB * bench_ep
 
 
+def _initial_captain_lines(
+    df,
+    team: state.TeamState,
+    phases: dict[int, str],
+    kickoffs: dict[int, datetime] | None,
+) -> list[str]:
+    """Captain advice while the current captain has NOT played yet.
+
+    The armband can be moved live from a completed player to one not yet
+    played, so the best opening captain is usually your EARLIEST strong
+    option: captain him first and roll the armband toward your higher-EP
+    anchor if he disappoints (option value). This surfaces that plan before
+    the round unfolds, instead of the old flat 'nothing to do'.
+    """
+    by_id = df.set_index("id")
+    cap = by_id.loc[team.captain_id]
+    candidates = [
+        (
+            pid,
+            float(by_id.loc[pid, "ep_match"]),
+            (kickoffs or {}).get(int(by_id.loc[pid, "squadId"])),
+        )
+        for pid in team.starters
+        if pid in by_id.index
+        and phases.get(int(by_id.loc[pid, "squadId"]), "scheduled") == "scheduled"
+    ]
+    plan = captain_mod.plan_captain(candidates)
+    if plan is None:
+        return [f"Captain {cap['name']} has not played yet: nothing to do."]
+
+    if plan.initial != team.captain_id and plan.initial in by_id.index:
+        target = by_id.loc[plan.initial]
+        deadline = _deadline(kickoffs, int(target["squadId"]))
+        if plan.premium > 0 and plan.anchor != plan.initial and plan.anchor in by_id.index:
+            anchor = by_id.loc[plan.anchor]
+            return [
+                f"MOVE the armband to {target['name']} ({target['squadName']}, "
+                f"{target['ep_match']:.1f} EP): he is your earliest strong "
+                f"option, so captain him first and roll it live toward "
+                f"{anchor['name']} ({anchor['ep_match']:.1f} EP) if he "
+                f"disappoints (option value ~+{plan.premium:.1f} captain pts)."
+                + deadline
+            ]
+        return [
+            f"Consider captaining {target['name']} ({target['squadName']}, "
+            f"{target['ep_match']:.1f} EP) instead of {cap['name']}: higher "
+            "expected and not yet played." + deadline
+        ]
+
+    # Current captain is already the right opening pick: remind to re-check
+    # after his match for a possible roll to a later, still-unplayed option.
+    later = [
+        pid for pid in plan.sequence
+        if pid != team.captain_id and pid in by_id.index
+    ]
+    if plan.initial == team.captain_id and later:
+        nxt = by_id.loc[max(later, key=lambda p: float(by_id.loc[p, "ep_match"]))]
+        return [
+            f"Captain {cap['name']} plays first among your strong options: keep "
+            f"the armband on him, then re-run `live` after his match - if he "
+            f"disappoints you can roll it to {nxt['name']} "
+            f"({nxt['ep_match']:.1f} EP) before kickoff."
+        ]
+    return [f"Captain {cap['name']} has not played yet: nothing to do."]
+
+
 def captain_advice(
     df,
     team: state.TeamState,
@@ -195,7 +263,7 @@ def captain_advice(
     cap_phase = phases.get(int(cap["squadId"]), "scheduled")
 
     if cap_phase == "scheduled":
-        return [f"Captain {cap['name']} has not played yet: nothing to do."]
+        return _initial_captain_lines(df, team, phases, kickoffs)
     if cap_phase == "live":
         return [
             f"Captain {cap['name']} is playing now (locked): re-run after "
@@ -363,9 +431,189 @@ def lineup_set_for_future_round(team_round_no: int, live_round_no: int) -> bool:
     return bool(team_round_no) and team_round_no > live_round_no
 
 
+# ------------------------------------------------------------ recording
+# `live` only suggests captain switches and subs; it never knew which one
+# the user actually executed in the game, so the saved XI stayed stale and
+# every re-run re-suggested the same move. These helpers record the real
+# change locally (the user states what he did), so the advice stops looping.
+
+def _label(by_id, pid: int) -> str:
+    if pid in by_id.index:
+        row = by_id.loc[pid]
+        return f"{row['name']} ({row['squadName']})"
+    return f"id {pid}"
+
+
+def resolve_my_player(name: str, df, team: state.TeamState) -> int:
+    """Resolve free-text `name` to exactly one of MY player ids.
+
+    Matches only within the saved 15-man squad (you can only captain or sub
+    your own players), trying exact, then case-insensitive substring, then a
+    fuzzy fallback for typos. Raises ValueError listing the squad on a miss
+    or an ambiguous match, so the caller aborts before mutating anything.
+    """
+    by_id = df.set_index("id")
+    mine = [
+        (pid, str(by_id.loc[pid, "name"]))
+        for pid in team.player_ids
+        if pid in by_id.index
+    ]
+    if not mine:
+        raise ValueError("Your saved squad is empty: run `team apply` first.")
+    target = name.strip().casefold()
+
+    def _fail() -> None:
+        roster = ", ".join(sorted(nm for _, nm in mine))
+        raise ValueError(
+            f"{name!r} did not match exactly one of your players. "
+            f"Your squad: {roster}."
+        )
+
+    for candidates in (
+        [pid for pid, nm in mine if nm.casefold() == target],            # exact
+        [pid for pid, nm in mine if target and target in nm.casefold()],  # substring
+    ):
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            _fail()
+    # Fuzzy fallback: tolerate a typo or a missing accent.
+    close = get_close_matches(name, [nm for _, nm in mine], n=2, cutoff=0.6)
+    fuzzy = [pid for pid, nm in mine if nm in close]
+    if len(fuzzy) == 1:
+        return fuzzy[0]
+    _fail()
+
+
+def record_substitution(team: state.TeamState, out_id: int, in_id: int, df) -> str:
+    """Apply a manual sub (starter `out_id` <- bench `in_id`) to the saved
+    state. Validates squad membership and that the XI stays a legal
+    formation; raises ValueError otherwise WITHOUT mutating. The outgoing
+    starter inherits the incoming player's bench slot."""
+    by_id = df.set_index("id")
+    bench = list(team.bench_order)
+    if team.bench_gk_id is not None:
+        bench.append(team.bench_gk_id)
+    if out_id not in team.starters:
+        raise ValueError(f"{_label(by_id, out_id)} is not in your starting XI.")
+    if in_id not in bench:
+        raise ValueError(f"{_label(by_id, in_id)} is not on your bench.")
+    if out_id == in_id:
+        raise ValueError("Out and in are the same player.")
+    out_pos = str(by_id.loc[out_id, "position"])
+    in_pos = str(by_id.loc[in_id, "position"])
+    positions = [
+        str(by_id.loc[pid, "position"]) for pid in team.starters if pid in by_id.index
+    ]
+    if not formation_valid_after_swap(positions, out_pos, in_pos):
+        raise ValueError(
+            f"Subbing {_label(by_id, out_id)} ({out_pos}) for "
+            f"{_label(by_id, in_id)} ({in_pos}) would not leave a legal "
+            "formation. Check the names."
+        )
+    team.starters = [in_id if pid == out_id else pid for pid in team.starters]
+    if in_id == team.bench_gk_id:
+        team.bench_gk_id = out_id
+    else:
+        team.bench_order = [out_id if pid == in_id else pid for pid in team.bench_order]
+    return f"Sub recorded: {_label(by_id, out_id)} OUT, {_label(by_id, in_id)} IN."
+
+
+def record_captain(
+    team: state.TeamState, new_id: int, df, explicit_vice: bool = False
+) -> str:
+    """Set the captain to `new_id` (must be a starter). If the new captain
+    was the vice and no explicit vice is being set, move the old captain
+    into the vice slot so the two never coincide (the common in-game
+    captain<->vice swap)."""
+    by_id = df.set_index("id")
+    if new_id not in team.starters:
+        raise ValueError(
+            f"{_label(by_id, new_id)} must be in your starting XI to be captain."
+        )
+    old = team.captain_id
+    team.captain_id = new_id
+    msg = f"Captain recorded: {_label(by_id, new_id)}."
+    if (
+        not explicit_vice
+        and new_id == team.vice_captain_id
+        and old is not None
+        and old in team.starters
+        and old != new_id
+    ):
+        team.vice_captain_id = old
+        msg += f" Vice moved to {_label(by_id, old)} (the previous captain)."
+    return msg
+
+
+def apply_recorded_changes(
+    team: state.TeamState,
+    df,
+    round_no: int,
+    *,
+    mark_changed: bool = False,
+    captain: str | None = None,
+    sub_out: str | None = None,
+    sub_in: str | None = None,
+    vice: str | None = None,
+) -> list[str]:
+    """Record in local state a change actually executed in the game this
+    round, so `live` stops re-suggesting it. Mutates `team` in place and
+    returns confirmation lines; raises ValueError on bad input (the caller
+    saves only on success). Any recorded change also marks the round as
+    changed - the first manual change is what cancels auto-subs and the vice
+    insurance, and repeating it for further changes is idempotent."""
+    by_id = df.set_index("id")
+    if (sub_out is None) != (sub_in is None):
+        raise ValueError("Use --sub-out and --sub-in together.")
+
+    # Resolve every name up front so a typo aborts before any mutation.
+    sub_pair = None
+    if sub_out is not None:
+        sub_pair = (
+            resolve_my_player(sub_out, df, team),
+            resolve_my_player(sub_in, df, team),
+        )
+    cap_id = resolve_my_player(captain, df, team) if captain else None
+    vice_id = resolve_my_player(vice, df, team) if vice else None
+
+    lines: list[str] = []
+    if sub_pair is not None:
+        lines.append(record_substitution(team, sub_pair[0], sub_pair[1], df))
+    if cap_id is not None:
+        lines.append(record_captain(team, cap_id, df, explicit_vice=vice_id is not None))
+    if vice_id is not None:
+        if vice_id not in team.starters:
+            raise ValueError(
+                f"{_label(by_id, vice_id)} must be in your starting XI to be "
+                "vice-captain."
+            )
+        team.vice_captain_id = vice_id
+        lines.append(f"Vice-captain recorded: {_label(by_id, vice_id)}.")
+    if team.captain_id is not None and team.captain_id == team.vice_captain_id:
+        raise ValueError("Captain and vice-captain cannot be the same player.")
+
+    changed = sub_pair is not None or cap_id is not None or vice_id is not None
+    if changed or mark_changed:
+        team.manual_changes_round = round_no
+    if mark_changed and not changed:
+        lines.append(
+            "Recorded: manual change made this round (auto-subs and vice "
+            "insurance are off from now on)."
+        )
+    return lines
+
+
 # ------------------------------------------------------------ orchestrator
 
-def run(mark_changed: bool = False) -> None:
+def run(
+    mark_changed: bool = False,
+    *,
+    captain: str | None = None,
+    sub_out: str | None = None,
+    sub_in: str | None = None,
+    vice: str | None = None,
+) -> None:
     console.print("[bold]Refreshing FIFA feeds...[/bold]")
     fifa_client.refresh()
     player_points.apply_calibration()
@@ -396,17 +644,26 @@ def run(mark_changed: bool = False) -> None:
             "round only after this one is over.\n"
         )
 
-    if mark_changed:
-        team.manual_changes_round = round_no
+    df = features.player_table(players_raw, squads)
+
+    # Record any change actually executed in the game, so the advice below
+    # reflects it and stops re-suggesting it. Names resolve against my squad.
+    if any([mark_changed, captain, sub_out, sub_in, vice]):
+        try:
+            messages = apply_recorded_changes(
+                team, df, round_no, mark_changed=mark_changed,
+                captain=captain, sub_out=sub_out, sub_in=sub_in, vice=vice,
+            )
+        except ValueError as exc:
+            console.print(f"[bold red]Nothing recorded:[/bold red] {exc}")
+            return
         state.save(team)
-        console.print(
-            "Recorded: manual change made this round (auto-subs and vice "
-            "insurance are off from now on)."
-        )
+        for line in messages:
+            console.print(f"  - {line}")
+        console.print()
 
     phases = squad_phases(rnd)
     kickoffs = round_kickoffs(rnd)
-    df = features.player_table(players_raw, squads)
     # Injury / availability discount so a player ruled out is never
     # offered as a sub or captain target. Confirmed lineups (published
     # ~1h before kickoff) override the injuries feed when available.
@@ -453,6 +710,9 @@ def run(mark_changed: bool = False) -> None:
         console.print(f"  - {line}")
 
     console.print(
-        "\nIf you execute any change in the game, re-run with: "
-        "[bold]python -m wcfantasy live --mark-changed[/bold]"
+        "\nIf you execute a change in the game, record WHAT you changed so "
+        "this advice stops re-suggesting it, e.g.:\n"
+        '  [bold]python -m wcfantasy live --captain "<name>"[/bold]\n'
+        '  [bold]python -m wcfantasy live --sub-out "<name>" --sub-in "<name>"[/bold]\n'
+        "(both imply --mark-changed; plain --mark-changed only flags the round)."
     )

@@ -13,7 +13,8 @@ the official effects (rules.BOOSTERS) plus the user's strategy:
   one that reaches the final is +2.
 """
 
-from datetime import datetime, timezone
+import math
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -38,95 +39,171 @@ def ordered_bench(df: pd.DataFrame, solution: SquadSolution) -> tuple[list[int],
     return outfield, gk
 
 
+# --------------------------------------------------- option-value captaincy
+# A single-match captain score is volatile (a haul vs a quiet 2-pointer) and
+# the armband is switchable live, unlimited times, from a COMPLETED player to
+# one not yet played. So captaining the EARLIEST strong starter first and
+# rolling the armband to a later, higher-EP one if he disappoints banks the
+# MAX of the early realisation and the later expectation - worth more than
+# captaining the single highest-EP starter outright, even when the early one
+# rates a fair bit lower (the EP estimate is itself noisy). These constants
+# drive that estimate; they are deliberate approximations, calibratable once
+# real WC captain scores accumulate.
+CAPTAIN_SCORE_CV = 0.65         # SD of a captain score as a fraction of its EP
+CAPTAIN_SCORE_SD_FLOOR = 2.0    # min SD so low-EP players still carry spread
+CAPTAIN_SWITCH_COST = 0.7       # pts forfeited by the FIRST live armband move
+                                # (auto-sub + vice insurance), incurred once
+CAPTAIN_CONTENDER_FLOOR = 0.70  # ignore starters below this fraction of the
+                                # top EP as captain candidates (replaces the old
+                                # hard 0.92 gate that rejected the option play)
+CAPTAIN_MIN_PREMIUM = 0.1       # don't churn the armband for a negligible edge
+
+
+@dataclass
+class CaptainPlan:
+    """Recommended captaincy for a round, accounting for the live option."""
+
+    initial: int                # who to captain FIRST (earliest strong option)
+    anchor: int                 # highest-EP starter (captain-outright baseline)
+    sequence: list[int] = field(default_factory=list)  # strong options, kickoff order
+    premium: float = 0.0        # doubled option gain over the anchor, net of cost
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+
+
+def _expected_max(mu: float, sd: float, floor: float) -> float:
+    """E[max(X, floor)] for X ~ N(mu, sd**2) - the normal call-option value."""
+    if sd <= 0:
+        return max(mu, floor)
+    d = (mu - floor) / sd
+    return mu * _norm_cdf(d) + floor * _norm_cdf(-d) + sd * _norm_pdf(d)
+
+
+def sequential_captain_value(
+    mus: list[float],
+    *,
+    cv: float = CAPTAIN_SCORE_CV,
+    sd_floor: float = CAPTAIN_SCORE_SD_FLOOR,
+) -> float:
+    """EV (un-doubled) of optimally captaining players given in KICKOFF order.
+
+    Policy: hold the armband on the first, then after each match keep it or
+    roll to the next not-yet-played player. Backward recursion
+    V_i = E[max(X_i, V_{i+1})], V_last = mu_last. Monotone: the value of
+    starting earliest is >= captaining any single player outright.
+    """
+    if not mus:
+        return 0.0
+    v = mus[-1]
+    for mu in reversed(mus[:-1]):
+        v = _expected_max(mu, max(cv * mu, sd_floor), v)
+    return v
+
+
+def plan_captain(
+    candidates: list[tuple],
+    *,
+    cv: float = CAPTAIN_SCORE_CV,
+    sd_floor: float = CAPTAIN_SCORE_SD_FLOOR,
+    switch_cost: float = CAPTAIN_SWITCH_COST,
+    contender_floor: float = CAPTAIN_CONTENDER_FLOOR,
+    min_premium: float = CAPTAIN_MIN_PREMIUM,
+) -> CaptainPlan | None:
+    """Decide the initial captain from (id, ep, kickoff) tuples.
+
+    Returns the highest-EP starter (the anchor) unless captaining an EARLIER
+    strong starter first and rolling the armband to the anchor is worth more:
+    the doubled option premium must beat the one-off live-switch cost. A
+    `kickoff` of None means the time is unknown - such players cannot anchor a
+    timed roll and only count as the fallback anchor.
+    """
+    cand = [(int(pid), float(ep), ko) for pid, ep, ko in candidates]
+    if not cand:
+        return None
+    anchor_id, top_ep, _ = max(cand, key=lambda c: c[1])
+    if top_ep <= 0:
+        return CaptainPlan(initial=anchor_id, anchor=anchor_id, sequence=[anchor_id])
+
+    strong = sorted(
+        (c for c in cand if c[2] is not None and c[1] >= contender_floor * top_ep),
+        key=lambda c: (c[2], -c[1]),  # earliest kickoff; same slot -> higher EP first
+    )
+    if len(strong) < 2 or strong[0][0] == anchor_id:
+        # only one real option, or the best already plays first: no roll to gain
+        return CaptainPlan(
+            initial=anchor_id, anchor=anchor_id,
+            sequence=[c[0] for c in strong] or [anchor_id],
+        )
+
+    mus = [c[1] for c in strong]
+    v_seq = sequential_captain_value(mus, cv=cv, sd_floor=sd_floor)
+    v_rest = sequential_captain_value(mus[1:], cv=cv, sd_floor=sd_floor)
+    sd0 = max(cv * mus[0], sd_floor)
+    p_roll = _norm_cdf((v_rest - mus[0]) / sd0) if sd0 > 0 else float(mus[0] < v_rest)
+    premium = 2.0 * (v_seq - top_ep) - p_roll * switch_cost
+    if premium > min_premium:
+        return CaptainPlan(
+            initial=strong[0][0], anchor=anchor_id,
+            sequence=[c[0] for c in strong], premium=premium,
+        )
+    return CaptainPlan(
+        initial=anchor_id, anchor=anchor_id, sequence=[c[0] for c in strong],
+    )
+
+
+def recommend_captain(
+    df: pd.DataFrame,
+    solution: SquadSolution,
+    rounds: list[dict],
+    next_round: int,
+    **kwargs,
+) -> CaptainPlan:
+    """CaptainPlan for the solved squad: option-value pick over the starters,
+    falling back to the ILP captain when there is nothing to act on."""
+    starters = df[df["id"].isin(solution.starter_ids)]
+    rnd = next((r for r in rounds if r["id"] == next_round), None)
+    kickoff = fixtures.kickoffs_by_squad(rnd) if rnd else {}
+    candidates = list(zip(
+        starters["id"].astype(int),
+        starters["ep_match"].astype(float),
+        [kickoff.get(int(s)) for s in starters["squadId"]],
+    ))
+    plan = plan_captain(candidates, **kwargs)
+    if plan is None:
+        return CaptainPlan(
+            initial=solution.captain_id, anchor=solution.captain_id,
+            sequence=[solution.captain_id],
+        )
+    return plan
+
+
 def captain_timing_note(
     df: pd.DataFrame,
     solution: SquadSolution,
     rounds: list[dict],
     next_round: int,
-    tolerance: float = 0.92,
 ) -> str | None:
-    """Option-value check on kickoff order.
-
-    A live captain switch needs the old captain COMPLETED and the new
-    one not yet played, so with two near-equal candidates the armband
-    should go to whoever plays EARLIER: if he flops you move it to the
-    later one, the reverse is locked out. Returns None when the gap is
-    big enough that timing does not matter.
-    """
-    rnd = next((r for r in rounds if r["id"] == next_round), None)
-    if rnd is None:
+    """Explain an option-value captaincy: when the recommended initial captain
+    is NOT the highest-EP starter, spell out the play and its deadline. None
+    when the best starter is also the right one to captain first."""
+    plan = recommend_captain(df, solution, rounds, next_round)
+    if plan.initial == plan.anchor:
         return None
-    kickoff = fixtures.kickoffs_by_squad(rnd)
-
-    starters = df[df["id"].isin(solution.starter_ids)]
-    ranked = starters.sort_values("ep_match", ascending=False)
-    cap_rows = ranked[ranked["id"] == solution.captain_id]
-    contenders = ranked[ranked["id"] != solution.captain_id]
-    if cap_rows.empty or contenders.empty:
-        return None
-    cap, runner = cap_rows.iloc[0], contenders.iloc[0]
-    cap_ko = kickoff.get(int(cap["squadId"]))
-    run_ko = kickoff.get(int(runner["squadId"]))
-    if (
-        cap_ko is None
-        or run_ko is None
-        or runner["ep_match"] < tolerance * cap["ep_match"]
-    ):
-        return None
-    if run_ko < cap_ko:
-        return (
-            f"Timing: {runner['name']} ({runner['ep_match']:.1f} EP) is nearly "
-            f"level with {cap['name']} and plays EARLIER: give him the armband "
-            "first; keep it if he hauls, otherwise switch live to "
-            f"{cap['name']} before his kickoff."
-        )
-    if cap_ko < run_ko:
-        return (
-            f"Timing: captain {cap['name']} plays before {runner['name']}; if "
-            "he disappoints you can still move the armband to "
-            f"{runner['name']} live before his match."
-        )
-    return None
-
-
-def captain_by_timing(
-    df: pd.DataFrame,
-    solution: SquadSolution,
-    rounds: list[dict],
-    next_round: int,
-    tolerance: float = 0.92,
-) -> int:
-    """Captain pick adjusted for kickoff order (option value).
-
-    The ILP captains the highest-EP starter. But the armband is switchable
-    live (old captain COMPLETED -> new one not yet played), so among the
-    starters within `tolerance` of the top EP the captaincy should go to
-    whoever plays EARLIEST: if he flops you can still move it to a later
-    contender, never the reverse. Returns the chosen captain id, falling
-    back to the ILP pick when there is no near-equal contender or no kickoff
-    time to act on. captain_timing_note then explains the choice.
-    """
-    starters = df[df["id"].isin(solution.starter_ids)]
-    if starters.empty:
-        return solution.captain_id
-    top_ep = float(starters["ep_match"].max())
-    contenders = starters[starters["ep_match"] >= tolerance * top_ep]
-    rnd = next((r for r in rounds if r["id"] == next_round), None)
-    if rnd is None or len(contenders) <= 1:
-        return solution.captain_id
-
-    kickoff = fixtures.kickoffs_by_squad(rnd)
-    far_future = datetime.max.replace(tzinfo=timezone.utc)
-
-    def sort_key(row: dict):
-        # earliest kickoff first; unknown kickoff sorts last; higher EP
-        # breaks a same-time tie so the stronger player keeps the armband.
-        return (kickoff.get(int(row["squadId"]), far_future), -float(row["ep_match"]))
-
-    best = min(contenders.to_dict("records"), key=sort_key)
-    if kickoff.get(int(best["squadId"]), far_future) is far_future:
-        return solution.captain_id  # no timing info: keep the ILP pick
-    return int(best["id"])
+    names = df.set_index("id")["name"]
+    early, anchor = names.get(plan.initial), names.get(plan.anchor)
+    return (
+        f"Timing/option value: captain {early} FIRST (the earliest of your "
+        f"strong options); if he underdelivers, roll the armband live to "
+        f"{anchor} before his kickoff. Banks the better of the two "
+        f"(~+{plan.premium:.1f} captain pts vs captaining {anchor} outright) - "
+        f"but only if you re-run `live` to move it before {anchor}'s match."
+    )
 
 
 def twelfth_man_pick(df: pd.DataFrame, solution: SquadSolution) -> pd.Series:

@@ -33,6 +33,29 @@ def main() -> None:
         help="record that a manual change was made in the game this round "
         "(cancels auto-subs and vice insurance)",
     )
+    live_p.add_argument(
+        "--captain",
+        metavar="NAME",
+        help="record that you changed the captain to this player of your "
+        "squad (implies --mark-changed)",
+    )
+    live_p.add_argument(
+        "--sub-out",
+        metavar="NAME",
+        help="record a manual substitution: the starter you moved OUT "
+        "(use with --sub-in; implies --mark-changed)",
+    )
+    live_p.add_argument(
+        "--sub-in",
+        metavar="NAME",
+        help="the bench player you moved IN (use with --sub-out)",
+    )
+    live_p.add_argument(
+        "--vice",
+        metavar="NAME",
+        help="record that you changed the vice-captain to this player "
+        "(implies --mark-changed)",
+    )
 
     team = sub.add_parser("team", help="manage local team state")
     team.add_argument("action", choices=["show", "apply", "use-booster"])
@@ -67,7 +90,13 @@ def main() -> None:
     elif args.command == "odds":
         advise.show_odds()
     elif args.command == "live":
-        live.run(mark_changed=args.mark_changed)
+        live.run(
+            mark_changed=args.mark_changed,
+            captain=args.captain,
+            sub_out=args.sub_out,
+            sub_in=args.sub_in,
+            vice=args.vice,
+        )
     elif args.command == "calibrate":
         calibrate.run(write=args.write)
     elif args.command == "team":

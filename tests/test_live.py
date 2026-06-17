@@ -201,3 +201,154 @@ def test_round_kickoffs_parses_dates():
     kickoffs = live.round_kickoffs(rnd)
     assert set(kickoffs) == {1, 2}
     assert kickoffs[1].hour == 20
+
+
+# ------------------------------------------------------------ recording
+
+def test_resolve_my_player_matches_within_squad():
+    df = pd.DataFrame([
+        {"id": 1, "name": "Lionel Messi", "squadName": "ARG", "squadId": 1, "position": "FWD"},
+        {"id": 2, "name": "Kylian Mbappe", "squadName": "FRA", "squadId": 2, "position": "FWD"},
+        {"id": 3, "name": "Jude Bellingham", "squadName": "ENG", "squadId": 3, "position": "MID"},
+        {"id": 9, "name": "Someone Else", "squadName": "XXX", "squadId": 9, "position": "DEF"},
+    ])
+    t = TeamState(player_ids=[1, 2, 3])  # id 9 is NOT in my squad
+    assert live.resolve_my_player("Messi", df, t) == 1            # substring
+    assert live.resolve_my_player("kylian mbappe", df, t) == 2    # exact, case-insensitive
+    assert live.resolve_my_player("Bellinghma", df, t) == 3       # fuzzy typo
+    with pytest.raises(ValueError):
+        live.resolve_my_player("Someone Else", df, t)             # not in MY squad
+    with pytest.raises(ValueError):
+        live.resolve_my_player("zzzzz", df, t)                    # no match
+
+
+def test_record_substitution_outfield_updates_starters_and_bench(squad_df, team):
+    msg = live.record_substitution(team, out_id=6, in_id=12, df=squad_df)
+    assert 12 in team.starters and 6 not in team.starters
+    assert 6 in team.bench_order and 12 not in team.bench_order
+    assert team.bench_gk_id == 15  # untouched
+    assert "OUT" in msg and "IN" in msg
+
+
+def test_record_substitution_gk_updates_bench_gk(squad_df, team):
+    live.record_substitution(team, out_id=1, in_id=15, df=squad_df)
+    assert 15 in team.starters and 1 not in team.starters
+    assert team.bench_gk_id == 1
+
+
+def test_record_substitution_rejects_illegal_swap(squad_df, team):
+    with pytest.raises(ValueError):
+        live.record_substitution(team, out_id=1, in_id=12, df=squad_df)  # GK <-> FWD
+
+
+def test_record_substitution_rejects_non_members(squad_df, team):
+    with pytest.raises(ValueError):
+        live.record_substitution(team, out_id=12, in_id=13, df=squad_df)  # out is a bench player
+    with pytest.raises(ValueError):
+        live.record_substitution(team, out_id=6, in_id=7, df=squad_df)    # in is a starter
+
+
+def test_record_captain_sets_captain(squad_df, team):
+    live.record_captain(team, 10, squad_df)
+    assert team.captain_id == 10
+
+
+def test_record_captain_rejects_non_starter(squad_df, team):
+    with pytest.raises(ValueError):
+        live.record_captain(team, 12, squad_df)  # 12 is on the bench
+
+
+def test_record_captain_swaps_vice_on_conflict(squad_df, team):
+    # captain=11, vice=10; promoting the vice to captain moves the old
+    # captain (11) into the vice slot so the two never coincide
+    live.record_captain(team, 10, squad_df)
+    assert team.captain_id == 10 and team.vice_captain_id == 11
+
+
+def test_apply_recorded_changes_sub_and_captain_marks_round(squad_df, team):
+    lines = live.apply_recorded_changes(
+        team, squad_df, round_no=2, sub_out="p6", sub_in="p12", captain="p10"
+    )
+    assert team.manual_changes_round == 2
+    assert 12 in team.starters and 6 in team.bench_order
+    assert team.captain_id == 10
+    assert lines
+
+
+def test_apply_recorded_changes_requires_both_sub_args(squad_df, team):
+    with pytest.raises(ValueError):
+        live.apply_recorded_changes(team, squad_df, 2, sub_out="p6")
+
+
+def test_apply_recorded_changes_bare_mark_only_flags_the_round(squad_df, team):
+    lines = live.apply_recorded_changes(team, squad_df, 3, mark_changed=True)
+    assert team.manual_changes_round == 3
+    assert any("manual change" in line for line in lines)
+    # nothing structural moved
+    assert team.captain_id == 11 and team.starters == list(range(1, 12))
+
+
+def test_apply_recorded_changes_rejects_captain_equals_vice(squad_df, team):
+    with pytest.raises(ValueError):
+        live.apply_recorded_changes(team, squad_df, 2, captain="p9", vice="p9")
+
+
+def test_recorded_captain_change_stops_resuggestion(squad_df, team):
+    # Reproduces the reported bug: live re-proposes the same captain switch.
+    phases = {i: "scheduled" for i in range(1, 16)}
+    phases[11] = "completed"   # captain done with a low return
+    points = {11: 2.0}
+    before = live.captain_advice(squad_df, team, phases, points, change_cost=0.0)
+    assert any(line.startswith("SWITCH") for line in before)
+    # record the executed switch to the suggested candidate (best scheduled = p10)
+    live.apply_recorded_changes(team, squad_df, round_no=1, captain="p10")
+    after = live.captain_advice(squad_df, team, phases, points, change_cost=0.0)
+    assert not any(line.startswith("SWITCH") for line in after)
+    assert any("not played yet" in line for line in after)
+
+
+def test_recorded_sub_stops_resuggestion(squad_df, team):
+    phases = {i: "scheduled" for i in range(1, 16)}
+    phases[6] = "completed"
+    points = {6: 1.0}
+    before = live.substitution_advice(squad_df, team, phases, points, change_cost=0.0)
+    assert any(line.startswith("SUB p6") for line in before)
+    live.apply_recorded_changes(team, squad_df, round_no=1, sub_out="p6", sub_in="p12")
+    after = live.substitution_advice(squad_df, team, phases, points, change_cost=0.0)
+    assert not any(line.startswith("SUB p6") for line in after)
+
+
+# ------------------------------------------------- proactive (sequential) captaincy
+
+def test_live_proactive_suggests_earlier_captain(squad_df, team):
+    # Captain (id 11) has the highest EP but kicks off LAST; id 10 is nearly
+    # as good and plays earlier -> captain him first, roll to 11 if he flops.
+    phases = {i: "scheduled" for i in range(1, 16)}
+    kickoffs = {
+        10: datetime.fromisoformat("2026-06-20T18:00:00+00:00"),
+        11: datetime.fromisoformat("2026-06-21T18:00:00+00:00"),
+    }
+    lines = live.captain_advice(
+        squad_df, team, phases, points={}, change_cost=0.0, kickoffs=kickoffs
+    )
+    assert any("MOVE the armband to p10" in line for line in lines)
+
+
+def test_live_proactive_keeps_captain_when_he_plays_first(squad_df, team):
+    phases = {i: "scheduled" for i in range(1, 16)}
+    kickoffs = {
+        11: datetime.fromisoformat("2026-06-20T18:00:00+00:00"),
+        10: datetime.fromisoformat("2026-06-21T18:00:00+00:00"),
+    }
+    lines = live.captain_advice(
+        squad_df, team, phases, points={}, change_cost=0.0, kickoffs=kickoffs
+    )
+    assert any("plays first among your strong options" in line for line in lines)
+
+
+def test_live_proactive_nothing_to_do_without_kickoffs(squad_df, team):
+    phases = {i: "scheduled" for i in range(1, 16)}
+    lines = live.captain_advice(
+        squad_df, team, phases, points={}, change_cost=0.0, kickoffs=None
+    )
+    assert any("nothing to do" in line for line in lines)
