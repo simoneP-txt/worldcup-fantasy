@@ -19,6 +19,18 @@ import pulp
 from .. import rules
 
 BENCH_WEIGHT = 0.15
+# The BACKUP GK is worth far less than an outfield bench player: you start
+# exactly one keeper, and a GK can only be auto-subbed by the other GK, so
+# the second keeper scores only when your #1 plays zero minutes and no manual
+# change is made that round (rare for a nailed starter, ~P(DNP)). Weighting
+# him like an outfield sub made the ILP burn budget on a strong, expensive
+# backup; a near-zero weight makes it take the cheapest viable bench GK and
+# spend the saving on the starting XI.
+BENCH_GK_WEIGHT = 0.03
+# Tiebreak only: among ~worthless backup keepers, prefer the cheapest so the
+# budget is freed for the XI instead of parked on a 5m bench GK who never
+# plays. Tiny enough not to override any real bench-value gap (see _bench_value).
+BENCH_GK_PRICE_TIEBREAK = 0.005
 # Next round dominates; future rounds matter through ep_horizon at a
 # discount so the optimizer still grabs likely-finalist players early.
 HORIZON_WEIGHT = 0.35
@@ -39,6 +51,33 @@ class SquadSolution:
 
 def _player_score(row) -> float:
     return row.ep_match + HORIZON_WEIGHT * (row.ep_horizon - row.ep_match)
+
+
+def _bench_value(row) -> float:
+    """Objective value of a player while benched.
+
+    Outfield subs use a flat weight. The backup GK gets a much smaller one
+    (BENCH_GK_WEIGHT) AND is scaled by P(plays): a keeper who has lost his
+    starting spot (p_play ~ 0) would never come on, so he is not credited
+    bench value via his team's deep run (the horizon term in the score).
+    Without this a dead but expensive keeper from a finalist outscored a
+    cheap playing backup. p_play defaults to 1.0 when the column is absent
+    (synthetic test pools), leaving the weight-only behaviour.
+
+    A microscopic price term then breaks the (near-)tie that p_play scaling
+    creates among ~worthless backups in favour of the CHEAPEST one, so the
+    budget is not tied up in a 5m bench keeper who never plays. It is tiny
+    enough to never override a real bench-value difference and is applied
+    only to the benched keeper - price stays a budget constraint everywhere
+    else, never a quality signal.
+    """
+    base = _player_score(row)
+    if row.position != "GK":
+        return BENCH_WEIGHT * base
+    p_play = row.p_play if "p_play" in row.index else 1.0
+    if pd.isna(p_play):
+        p_play = 1.0
+    return BENCH_GK_WEIGHT * base * float(p_play) - BENCH_GK_PRICE_TIEBREAK * row.price
 
 
 def build_squad(
@@ -64,10 +103,11 @@ def build_squad(
     captain = prob.add_variable_dicts("captain", idx, cat="Binary")
 
     score = {i: _player_score(pool.loc[i]) for i in idx}
+    bench_value = {i: _bench_value(pool.loc[i]) for i in idx}
     prob += pulp.lpSum(
         starter[i] * score[i]
         + captain[i] * pool.loc[i, "ep_match"]
-        + (in_squad[i] - starter[i]) * BENCH_WEIGHT * score[i]
+        + (in_squad[i] - starter[i]) * bench_value[i]
         for i in idx
     )
 
