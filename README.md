@@ -46,6 +46,10 @@ python -m wcfantasy serve            # http://127.0.0.1:8765
 python -m wcfantasy serve --port 9000 --no-browser
 ```
 
+It opens on **My team**, your current squad at a glance:
+
+![My team in the web app](docs/web-myteam.png)
+
 Open **Plan round** and the advisor refreshes the FIFA feeds, rebuilds the plan, and shows
 the recommended squad for the next round:
 
