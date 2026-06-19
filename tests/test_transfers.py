@@ -62,16 +62,20 @@ def test_unlimited_window_is_full_rebuild(current_team):
     assert {101, 102, 103} <= set(plan.solution.squad_ids)
 
 
-def test_caps_at_free_allowance_no_voluntary_paid(current_team):
-    # 3 huge upgrades available, but only 2 free transfers: the user never
-    # pays a voluntary -3, so advise takes exactly 2 and leaves the third
-    # (the Wildcard is the route for a bigger rebuild)
+def test_takes_worthwhile_voluntary_paid_transfer(current_team):
+    # 3 huge upgrades available, only 2 free transfers. Each star adds ~10
+    # next-round pts, far above the 3-point penalty, so the planner now pays
+    # for the 3rd (a voluntary paid transfer, flagged as such).
     pool = _pool(star_ep=12.0)
     plan = plan_transfers(pool, current_team, budget=100.0, next_round=2)
     assert plan.free_allowance == 2
-    assert len(plan.in_ids) == 2
-    assert plan.n_paid == 0
-    assert plan.penalty_points == 0.0
+    assert len(plan.in_ids) == 3
+    assert {101, 102, 103} <= set(plan.solution.squad_ids)
+    assert plan.n_paid == 1
+    assert plan.n_forced_paid == 0
+    assert plan.n_voluntary_paid == 1
+    assert plan.penalty_points == 3.0
+    assert plan.nextround_gain > rules.EXTRA_TRANSFER_PENALTY
 
 
 def test_no_paid_transfer_for_marginal_gains(current_team):
@@ -80,6 +84,55 @@ def test_no_paid_transfer_for_marginal_gains(current_team):
     plan = plan_transfers(pool, current_team, budget=100.0, next_round=2)
     assert len(plan.in_ids) <= 2
     assert plan.n_paid == 0
+    assert plan.n_voluntary_paid == 0
+
+
+def test_horizon_value_does_not_justify_paid_transfer(current_team):
+    # A 3rd upgrade that is a monster over the HORIZON but barely better NEXT
+    # round must NOT trigger a -3: you would get it free at the next window,
+    # so only its next-round gain (~0) can justify paying now.
+    rows = _players(1, 1, ep=2.0, price=4.0)
+    for i, r in enumerate(rows):
+        r["squadId"] = 1 + i % 3
+    for k in range(3):
+        rows.append({
+            "id": 101 + k, "name": f"star{k}", "squadId": 4 + k,
+            "position": "MID", "price": 9.0,
+            "ep_match": 2.1,      # barely above the current squad next round
+            "ep_horizon": 50.0,   # but a monster over the rest of the tournament
+        })
+    pool = pd.DataFrame(rows)
+    plan = plan_transfers(pool, current_team, budget=100.0, next_round=2)
+    assert plan.n_paid == 0
+    assert plan.n_voluntary_paid == 0
+    assert len(plan.in_ids) <= 2
+
+
+def test_allowance_override_zero_forces_necessary_paid(current_team):
+    # one owned player is unplayable (ep 0 -> dropped from the pool). With the
+    # window's free transfers already spent (override 0), replacing him is a
+    # forced, necessary paid -3 -- this is the "already applied" round path.
+    pool = _pool(star_ep=12.0)
+    pool.loc[pool["id"] == 8, ["ep_match", "ep_horizon"]] = 0.0
+    plan = plan_transfers(
+        pool, current_team, budget=100.0, next_round=2,
+        allowance_override=0, forced_only=True,
+    )
+    assert 8 not in set(plan.solution.squad_ids)
+    assert plan.n_paid == 1
+    assert plan.n_forced_paid == 1
+    assert plan.n_voluntary_paid == 0
+    assert plan.penalty_points == 3.0
+
+
+def test_forced_only_suppresses_voluntary_paid(current_team):
+    # 3 big upgrades available; forced_only takes only the 2 free transfers and
+    # never the worth-it voluntary 3rd (used when the round is already applied).
+    pool = _pool(star_ep=12.0)
+    plan = plan_transfers(pool, current_team, budget=100.0, next_round=2, forced_only=True)
+    assert len(plan.in_ids) == 2
+    assert plan.n_paid == 0
+    assert plan.n_voluntary_paid == 0
 
 
 def test_infeasible_keep_constraint_does_not_crash(current_team):

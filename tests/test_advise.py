@@ -1,7 +1,12 @@
 import pandas as pd
 
 from wcfantasy import advise, state
-from wcfantasy.advise import fixture_schedule, next_round_number, squad_comparison
+from wcfantasy.advise import (
+    fixture_schedule,
+    next_round_number,
+    plan_round_after_apply,
+    squad_comparison,
+)
 from wcfantasy.optimizer.squad import SquadSolution
 
 
@@ -18,6 +23,17 @@ def test_next_round_number_skips_done_and_live_rounds():
     assert next_round_number(rounds) == 3
     rounds[2]["status"] = "complete"
     assert next_round_number(rounds) == 3  # all done: fall back to last round
+
+def test_plan_round_after_apply_advances_forces_or_completes():
+    # already applied an open round with everyone playable -> preview the next
+    assert plan_round_after_apply(open_round=2, max_round=8, forced_count=0) == (3, "advanced")
+    # a player can no longer play -> stay on the round, those moves are forced
+    assert plan_round_after_apply(open_round=2, max_round=8, forced_count=1) == (2, "forced")
+    # nothing forced and it was the last round -> nothing left to plan
+    assert plan_round_after_apply(open_round=8, max_round=8, forced_count=0) == (8, "complete")
+    # forced wins even on the last round (a finalist gets suspended)
+    assert plan_round_after_apply(open_round=8, max_round=8, forced_count=2) == (8, "forced")
+
 
 ROUNDS = [{
     "id": 1,

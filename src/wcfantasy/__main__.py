@@ -81,6 +81,18 @@ def main() -> None:
         "(default is a dry run)",
     )
 
+    serve_p = sub.add_parser(
+        "serve", help="start the local web app (and open the browser)"
+    )
+    serve_p.add_argument(
+        "--port", type=int, default=None,
+        help="port to serve on (default 8765)",
+    )
+    serve_p.add_argument(
+        "--no-browser", action="store_true",
+        help="do not open the browser automatically",
+    )
+
     args = parser.parse_args()
     if args.command == "advise":
         advise.run(from_scratch=args.from_scratch)
@@ -99,6 +111,13 @@ def main() -> None:
         )
     elif args.command == "calibrate":
         calibrate.run(write=args.write)
+    elif args.command == "serve":
+        from . import server
+
+        server.serve(
+            port=args.port or server.DEFAULT_PORT,
+            open_browser=not args.no_browser,
+        )
     elif args.command == "team":
         if args.action == "show":
             advise.show_team()

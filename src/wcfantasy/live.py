@@ -20,6 +20,8 @@ stats.roundPoints is a dict keyed by round number as string, e.g.
 {'1': 13}. The defensive fallbacks below stay as insurance.
 """
 
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from difflib import get_close_matches
 
@@ -31,6 +33,31 @@ from .models import player_points
 from .optimizer import captain as captain_mod
 
 console = Console()
+
+
+@dataclass
+class LiveState:
+    """Structured result of `compute_live_state`: the intra-round advice with
+    no console formatting. `status` selects the case the caller renders:
+    'ok' (full advice), 'no_team', 'no_live_round', or 'record_error' (a bad
+    --captain/--sub name). Shared by the CLI and the web `live` view so the
+    two never drift."""
+
+    status: str
+    message: str | None = None
+    round_no: int | None = None
+    lineup_warning: str | None = None
+    recorded: list[str] = field(default_factory=list)
+    recorded_error: str | None = None
+    already_changed: bool = False
+    change_cost: float = 0.0
+    change_cost_note: str | None = None
+    captain_lines: list[str] = field(default_factory=list)
+    sub_lines: list[str] = field(default_factory=list)
+    outlook_lines: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 # Rough chance that a starter whose match is still to play ends up with
 # no minutes (late knock, surprise rotation). Used only to price the
@@ -606,15 +633,27 @@ def apply_recorded_changes(
 
 # ------------------------------------------------------------ orchestrator
 
-def run(
-    mark_changed: bool = False,
+def compute_live_state(
     *,
+    mark_changed: bool = False,
     captain: str | None = None,
     sub_out: str | None = None,
     sub_in: str | None = None,
     vice: str | None = None,
-) -> None:
-    console.print("[bold]Refreshing FIFA feeds...[/bold]")
+    log: Callable[[str], None] | None = None,
+) -> LiveState:
+    """Intra-round advice as structured data (no console output).
+
+    Refreshes the feeds, finds the live round, optionally records a change the
+    user executed in-game (the --captain/--sub-out+--sub-in/--vice path, which
+    mutates and saves the local state), then computes the captain-switch,
+    substitution and round-outlook advice. `log` receives progress lines for a
+    live caller (CLI or web job). Returns a LiveState whose `status` tells the
+    caller which case to render.
+    """
+    emit = log or (lambda _msg: None)
+
+    emit("Refreshing FIFA feeds...")
     fifa_client.refresh()
     player_points.apply_calibration()
     players_raw = fifa_client.load("players")
@@ -623,44 +662,49 @@ def run(
 
     team = state.load()
     if not team.player_ids:
-        console.print("No saved team: run `advise` then `team apply` first.")
-        return
+        return LiveState(
+            status="no_team",
+            message="No saved team: run `advise` then `team apply` first.",
+        )
 
     rnd = current_live_round(rounds)
     if rnd is None:
-        console.print(
-            "No round is live right now: between rounds, run `advise` instead."
+        return LiveState(
+            status="no_live_round",
+            message="No round is live right now: between rounds, run `advise` instead.",
         )
-        return
     round_no = rnd["id"]
-    console.print(f"Live round: [bold]{round_no}[/bold]")
+    emit(f"Live round: {round_no}")
 
+    lineup_warning = None
     if lineup_set_for_future_round(team.round_no, round_no):
-        console.print(
-            f"[bold yellow]Warning:[/bold yellow] your saved team is set for "
-            f"round {team.round_no}, but round {round_no} is live now. The XI "
-            "below may be next round's plan, not what is on the pitch. On "
-            "transition days run `live` BEFORE `team apply`, and apply the next "
-            "round only after this one is over.\n"
+        lineup_warning = (
+            f"Warning: your saved team is set for round {team.round_no}, but "
+            f"round {round_no} is live now. The XI below may be next round's "
+            "plan, not what is on the pitch. On transition days run `live` "
+            "BEFORE `team apply`, and apply the next round only after this one "
+            "is over."
         )
 
     df = features.player_table(players_raw, squads)
 
     # Record any change actually executed in the game, so the advice below
     # reflects it and stops re-suggesting it. Names resolve against my squad.
+    recorded: list[str] = []
     if any([mark_changed, captain, sub_out, sub_in, vice]):
         try:
-            messages = apply_recorded_changes(
+            recorded = apply_recorded_changes(
                 team, df, round_no, mark_changed=mark_changed,
                 captain=captain, sub_out=sub_out, sub_in=sub_in, vice=vice,
             )
         except ValueError as exc:
-            console.print(f"[bold red]Nothing recorded:[/bold red] {exc}")
-            return
+            return LiveState(
+                status="record_error",
+                round_no=round_no,
+                lineup_warning=lineup_warning,
+                recorded_error=str(exc),
+            )
         state.save(team)
-        for line in messages:
-            console.print(f"  - {line}")
-        console.print()
 
     phases = squad_phases(rnd)
     kickoffs = round_kickoffs(rnd)
@@ -684,35 +728,94 @@ def run(
     changed_already = team.manual_changes_round == round_no
     cost = 0.0 if changed_already else first_change_cost(team, df, phases)
     if changed_already:
-        console.print(
+        change_cost_note = (
             "Manual change already made this round: auto-subs and vice "
-            "insurance are gone, further changes carry no hidden cost.\n"
+            "insurance are gone, further changes carry no hidden cost."
         )
     else:
-        console.print(
+        change_cost_note = (
             "No manual change yet this round: the first one cancels "
             f"auto-subs and the vice insurance (priced at ~{cost:.1f} pts "
-            "in the advice below).\n"
+            "in the advice below)."
         )
 
+    captain_lines = captain_advice(df, team, phases, points, cost, kickoffs)
+    sub_lines = substitution_advice(df, team, phases, points, cost, kickoffs) or [
+        "No substitution worth making right now."
+    ]
+    outlook_lines = round_outlook(df, team, phases, availability, kickoffs, observed) or [
+        "All your players have already played this round."
+    ]
+
+    return LiveState(
+        status="ok",
+        round_no=round_no,
+        lineup_warning=lineup_warning,
+        recorded=recorded,
+        already_changed=changed_already,
+        change_cost=round(float(cost), 2),
+        change_cost_note=change_cost_note,
+        captain_lines=captain_lines,
+        sub_lines=sub_lines,
+        outlook_lines=outlook_lines,
+    )
+
+
+_RECORD_HINT = (
+    "If you execute a change in the game, record WHAT you changed so this "
+    "advice stops re-suggesting it, e.g.:\n"
+    '  [bold]python -m wcfantasy live --captain "<name>"[/bold]\n'
+    '  [bold]python -m wcfantasy live --sub-out "<name>" --sub-in "<name>"[/bold]\n'
+    "(both imply --mark-changed; plain --mark-changed only flags the round)."
+)
+
+
+def _print_live(state: LiveState) -> None:
+    """Render a LiveState to the console (the CLI presentation of `live`)."""
+    if state.status in ("no_team", "no_live_round"):
+        console.print(state.message)
+        return
+
+    console.print(f"Live round: [bold]{state.round_no}[/bold]")
+    if state.lineup_warning:
+        console.print(f"[bold yellow]{state.lineup_warning}[/bold yellow]\n")
+
+    if state.status == "record_error":
+        console.print(f"[bold red]Nothing recorded:[/bold red] {state.recorded_error}")
+        return
+
+    for line in state.recorded:
+        console.print(f"  - {line}")
+    if state.recorded:
+        console.print()
+
+    console.print(state.change_cost_note + "\n")
+
     console.print("[bold]Captain:[/bold]")
-    for line in captain_advice(df, team, phases, points, cost, kickoffs):
+    for line in state.captain_lines:
         console.print(f"  - {line}")
 
     console.print("\n[bold]Substitutions:[/bold]")
-    subs = substitution_advice(df, team, phases, points, cost, kickoffs)
-    for line in subs or ["No substitution worth making right now."]:
+    for line in state.sub_lines:
         console.print(f"  - {line}")
 
-    outlook = round_outlook(df, team, phases, availability, kickoffs, observed)
     console.print("\n[bold]Still to play this round (P plays):[/bold]")
-    for line in outlook or ["All your players have already played this round."]:
+    for line in state.outlook_lines:
         console.print(f"  - {line}")
 
-    console.print(
-        "\nIf you execute a change in the game, record WHAT you changed so "
-        "this advice stops re-suggesting it, e.g.:\n"
-        '  [bold]python -m wcfantasy live --captain "<name>"[/bold]\n'
-        '  [bold]python -m wcfantasy live --sub-out "<name>" --sub-in "<name>"[/bold]\n'
-        "(both imply --mark-changed; plain --mark-changed only flags the round)."
+    console.print("\n" + _RECORD_HINT)
+
+
+def run(
+    mark_changed: bool = False,
+    *,
+    captain: str | None = None,
+    sub_out: str | None = None,
+    sub_in: str | None = None,
+    vice: str | None = None,
+) -> None:
+    state = compute_live_state(
+        mark_changed=mark_changed, captain=captain, sub_out=sub_out,
+        sub_in=sub_in, vice=vice, log=console.print,
     )
+    _print_live(state)

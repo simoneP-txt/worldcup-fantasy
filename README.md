@@ -38,6 +38,34 @@ The first run downloads and caches everything it needs into `data/`. Availabilit
 [The Odds API](https://the-odds-api.com) key for bookmaker odds; without it the model
 runs on Elo alone.
 
+## Web app
+
+Prefer clicks to the terminal? One command starts a local web GUI and opens the browser:
+
+```powershell
+python -m wcfantasy serve            # http://127.0.0.1:8765
+python -m wcfantasy serve --port 9000 --no-browser
+```
+
+It is the same engine as the CLI, in a browser — no Node/npm, just the Python venv.
+The slow commands (plan, fetch, odds, calibrate) run as background jobs with a live
+progress log, so the UI never blocks. Screens:
+
+- **My team** — your saved squad, XI vs bench, captain/vice, bench order, bank, boosters.
+- **Plan round** — runs `advise` (refreshes the feeds first), shows the recommended squad,
+  transfers, captain (with the option-value timing note), bench order, booster advice,
+  availability and unverified-starter watches, and your fixtures in Italian time. A
+  confirm-gated **“I executed these moves”** records the plan as your squad (`team apply`),
+  with the live-round guard.
+- **Ideal squad** — the unconstrained best 15 vs your squad (read-only, not applyable).
+- **Live** — captain/sub/outlook advice during a round, plus a form to record what you
+  actually changed in-game.
+- **Odds**, **Boosters** (one-per-tournament, Wildcard irreversible behind a confirm),
+  **Calibration** (dry run vs write), and **Settings** (English/Italian, source status).
+
+Like the CLI, the web app **never logs into your FIFA account**: it shows the moves to make
+by hand, then you confirm you made them.
+
 ## Commands
 
 All commands are `python -m wcfantasy <command>`.
@@ -52,6 +80,7 @@ All commands are `python -m wcfantasy <command>`.
 | `team use-booster <name>` | Mark a booster as used |
 | `calibrate` | Refit the priors against real results (`--write` to persist) |
 | `fetch` | Refresh the FIFA feeds only |
+| `serve` | Start the local web GUI and open the browser (see “Web app”) |
 
 ## Data sources
 

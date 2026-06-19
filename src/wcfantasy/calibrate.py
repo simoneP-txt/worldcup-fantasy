@@ -98,23 +98,52 @@ def metrics(pred: pd.Series, obs: pd.Series) -> dict:
     return out
 
 
-def run(write: bool = False) -> None:
+def compute_calibration(
+    *, write: bool = False, log=None
+) -> dict:
+    """Calibration preview as structured data (no console formatting).
+
+    Reads the LATEST local feeds (run `advise`/`fetch` first; no network here),
+    compares the un-tuned model against observed points and proposes refit
+    weights. With `write` and enough samples it persists calibration.json;
+    otherwise it only previews. `log` receives the human-readable report lines
+    so a caller (the CLI, or a web job) can surface them. Returns the
+    structured result the web view renders. The same dry-run/refusal rules as
+    the old `run()` apply.
+    """
+    emit = log or (lambda _msg: None)
+
     players_raw = fifa_client.load("players")
     squads = fifa_client.load("squads")
     df = features.player_table(players_raw, squads)
 
     obs = observed_per_match(df)
     n_played = int(obs.notna().sum())
-    console.print(f"Players with >= {MIN_MATCHES} WC match played: [bold]{n_played}[/bold]")
+    result: dict = {
+        "n_played": n_played,
+        "min_matches": MIN_MATCHES,
+        "min_samples": MIN_SAMPLES,
+        "default_price_metrics": None,
+        "refit_price_metrics": None,
+        "price_fit": None,
+        "club_blend": None,
+        "proposed_weights": {},
+        "written": False,
+        "refusal_reason": None,
+    }
+    emit(f"Players with >= {MIN_MATCHES} WC match played: {n_played}")
     if n_played == 0:
-        console.print("No World Cup matches played yet: nothing to calibrate.")
-        return
+        emit("No World Cup matches played yet: nothing to calibrate.")
+        result["refusal_reason"] = "no World Cup matches played yet"
+        return result
 
     # Baseline always uses the built-in defaults (calibrate never calls
     # apply_calibration), so 'before' is the un-tuned model.
     price_now = player_points.price_prior(df)
     club_ep = player_points.club_prior(df)
-    console.print(f"Default price prior vs observed: {metrics(price_now, obs)}")
+    default_price_metrics = metrics(price_now, obs)
+    result["default_price_metrics"] = default_price_metrics
+    emit(f"Default price prior vs observed: {default_price_metrics}")
 
     weights: dict[str, float] = {}
     refit_price = price_now
@@ -124,48 +153,64 @@ def run(write: bool = False) -> None:
         weights["price_slope"] = round(slope, 4)
         weights["price_intercept"] = round(intercept, 4)
         refit_price = (intercept + slope * df["price"]).clip(lower=0.5)
-        console.print(
-            f"Refit price prior vs observed:   {metrics(refit_price, obs)} "
+        result["price_fit"] = {"slope": round(slope, 4), "intercept": round(intercept, 4)}
+        result["refit_price_metrics"] = metrics(refit_price, obs)
+        emit(
+            f"Refit price prior vs observed:   {result['refit_price_metrics']} "
             f"(slope {slope:.3f}, intercept {intercept:.3f})"
         )
 
     n_club = int(club_ep.notna().sum())
     if n_club == 0:
-        console.print("No club projections available: skipping the club-weight fit.")
+        emit("No club projections available: skipping the club-weight fit.")
     else:
         w = fit_club_weight(club_ep, refit_price, obs)
         if w is not None:
             weights["club_prior_weight"] = round(w, 3)
             blended = w * club_ep + (1 - w) * refit_price
-            console.print(
+            blend_metrics = metrics(blended, obs)
+            result["club_blend"] = {"w": round(w, 3), "n_club": n_club, "metrics": blend_metrics}
+            emit(
                 f"Best club/price blend: w={w:.2f} "
-                f"(default 0.50) -> {metrics(blended, obs)}, {n_club} club-matched"
+                f"(default 0.50) -> {blend_metrics}, {n_club} club-matched"
             )
 
-    console.print(f"\n[bold]Proposed weights:[/bold] {weights or '(none)'}")
+    result["proposed_weights"] = weights
+    emit(f"Proposed weights: {weights or '(none)'}")
 
     if not write:
-        console.print(
-            f"Dry run. Re-run with [bold]--write[/bold] to persist to {CALIBRATION_FILE} "
+        emit(
+            f"Dry run. Re-run with --write to persist to {CALIBRATION_FILE} "
             "(advise/live then pick it up automatically)."
         )
-        return
+        result["refusal_reason"] = "dry run (use --write to persist)"
+        return result
     if n_played < MIN_SAMPLES:
-        console.print(
-            f"[yellow]Refusing to write[/yellow]: only {n_played} observations "
+        emit(
+            f"Refusing to write: only {n_played} observations "
             f"(need >= {MIN_SAMPLES}). Wait for more matches, then re-run."
         )
-        return
+        result["refusal_reason"] = (
+            f"only {n_played} observations (need >= {MIN_SAMPLES})"
+        )
+        return result
     if not weights:
-        console.print("[yellow]Nothing to write[/yellow]: no weight could be fit.")
-        return
+        emit("Nothing to write: no weight could be fit.")
+        result["refusal_reason"] = "no weight could be fit"
+        return result
 
     blob = {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "n_samples": n_played,
-        "metrics_before": metrics(price_now, obs),
+        "metrics_before": default_price_metrics,
         "weights": weights,
     }
     CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
     CALIBRATION_FILE.write_text(json.dumps(blob, indent=2), encoding="utf-8")
-    console.print(f"[green]Wrote[/green] {CALIBRATION_FILE}. advise/live use it from the next run.")
+    result["written"] = True
+    emit(f"Wrote {CALIBRATION_FILE}. advise/live use it from the next run.")
+    return result
+
+
+def run(write: bool = False) -> None:
+    compute_calibration(write=write, log=console.print)

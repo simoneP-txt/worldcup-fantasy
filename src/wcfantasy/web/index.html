@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WC Fantasy Advisor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="tricolor"></div>
+  <header class="app">
+    <div class="header-row">
+      <div class="brand">
+        <h1 data-i18n="app.title">WC Fantasy Advisor</h1>
+        <span class="tag" data-i18n="app.tagline"></span>
+      </div>
+      <div class="header-spacer"></div>
+      <div class="lang-select" id="lang-select" aria-label="Language"></div>
+    </div>
+    <div class="status-strip" id="status-strip"></div>
+    <nav class="tabs" id="tabs"></nav>
+  </header>
+
+  <main id="main">
+    <div class="semiauto-banner">
+      <span class="ic">&#9432;</span>
+      <span data-i18n="app.semiauto"></span>
+    </div>
+    <div id="view" class="view"></div>
+  </main>
+
+  <div id="modal-root"></div>
+  <div class="toast-wrap" id="toast-root"></div>
+
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>
