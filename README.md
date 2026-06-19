@@ -24,13 +24,12 @@ prints the moves to make by hand. It never logs into your FIFA account.
 - **Live:** after each match it advises captain swaps and substitutions, pricing in the
   auto-sub insurance you forfeit with the first manual change.
 
-## Quickstart
+## Setup
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e . -r requirements.txt
-python -m wcfantasy advise
 ```
 
 The first run downloads and caches everything it needs into `data/`. Availability
@@ -40,16 +39,26 @@ runs on Elo alone.
 
 ## Web app
 
-Prefer clicks to the terminal? One command starts a local web GUI and opens the browser:
+The simplest way to run it. One command starts a local web GUI and opens the browser:
 
 ```powershell
 python -m wcfantasy serve            # http://127.0.0.1:8765
 python -m wcfantasy serve --port 9000 --no-browser
 ```
 
-It is the same engine as the CLI, in a browser — no Node/npm, just the Python venv.
-The slow commands (plan, fetch, odds, calibrate) run as background jobs with a live
-progress log, so the UI never blocks. Screens:
+Open **Plan round** and the advisor refreshes the FIFA feeds, rebuilds the plan, and shows
+the recommended squad for the next round:
+
+![Plan round in the web app](docs/web-plan.png)
+
+Right below it, the transfers, captain, vice and bench order come out as a checklist you
+tick off by hand in the game:
+
+![Moves to execute, shown in the web app](docs/web-moves.png)
+
+The web app runs the same engine as the CLI, in a browser, with no Node or npm, just the
+Python venv. The slow commands (plan, fetch, odds, calibrate) run as background jobs with a
+live progress log, so the UI never blocks. Screens:
 
 - **My team** — your saved squad, XI vs bench, captain/vice, bench order, bank, boosters.
 - **Plan round** — runs `advise` (refreshes the feeds first), shows the recommended squad,
@@ -65,6 +74,16 @@ progress log, so the UI never blocks. Screens:
 
 Like the CLI, the web app **never logs into your FIFA account**: it shows the moves to make
 by hand, then you confirm you made them.
+
+## Terminal
+
+The same plan, in the console:
+
+```powershell
+python -m wcfantasy advise
+```
+
+![Output of the advise command](docs/advise.png)
 
 ## Commands
 
@@ -97,9 +116,3 @@ Everything except the FIFA feeds is optional.
 Semi-automatic: it reads public data and prints instructions; you make the moves in the
 game. Prices are fixed all tournament, so price is a quality signal and a budget cost,
 never a market. Unofficial, not affiliated with FIFA.
-
-## Example output
-
-`python -m wcfantasy advise` prints the recommended squad and the moves to make:
-
-![Output of the advise command](docs/advise.png)

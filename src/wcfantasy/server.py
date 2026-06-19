@@ -52,6 +52,17 @@ def create_app() -> FastAPI:
     """Build the FastAPI app (separate from `serve` so tests can drive it)."""
     app = FastAPI(title="wcfantasy", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
+    # The SPA assets are iterated on constantly; without this the browser's
+    # heuristic-freshness cache serves stale CSS/JS (StaticFiles sends only
+    # ETag/Last-Modified, no Cache-Control). On localhost the files are tiny,
+    # so just never cache them: every load gets the current bytes.
+    @app.middleware("http")
+    async def _no_store(request, call_next):
+        resp = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/assets"):
+            resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     # ---- read-only -------------------------------------------------------
     @app.get("/api/team")
     def get_team() -> dict:
