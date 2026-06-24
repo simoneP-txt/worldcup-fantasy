@@ -250,6 +250,9 @@ function movesCardNode(plan) {
   if (plan.captain_timing_note) {
     rows.append(moveRow("timing", "↻", null, plan.captain_timing_note));
   }
+  if (plan.lineup_timing_note) {
+    rows.append(moveRow("timing", "⏱", null, plan.lineup_timing_note));
+  }
 
   const strip = el("div", { class: "bench-strip" });
   plan.bench_order.forEach((b, i) =>
@@ -551,14 +554,21 @@ function calibrateResultNode(res) {
   if (res.club_blend) lines.push(`${t("calibrate.clubBlend")}: w=${res.club_blend.w} (${res.club_blend.n_club}) ${JSON.stringify(res.club_blend.metrics)}`);
   lines.push(`${t("calibrate.proposed")}: ${Object.keys(res.proposed_weights).length ? JSON.stringify(res.proposed_weights) : "(none)"}`);
 
-  const status = res.written
-    ? el("div", { class: "callout ok", text: t("calibrate.written") })
-    : el("div", { class: "callout", text: `${t("calibrate.notWritten")}: ${res.refusal_reason || ""}` });
+  const children = [el("ul", { class: "lines" }, lines.map((l) => el("li", { text: l })))];
 
-  return el("div", { class: "card" }, [
-    el("ul", { class: "lines" }, lines.map((l) => el("li", { text: l }))),
-    status,
-  ]);
+  // Candidates the gate rejected (kept the default), with the reason.
+  if (res.rejections && res.rejections.length) {
+    children.push(el("div", { class: "note", style: "margin-top:8px", text: t("calibrate.rejected") }));
+    children.push(el("ul", { class: "lines note" }, res.rejections.map((r) => el("li", { text: r }))));
+  }
+
+  children.push(
+    res.written
+      ? el("div", { class: "callout ok", text: t("calibrate.written") })
+      : el("div", { class: "callout", text: `${t("calibrate.notWritten")}: ${res.refusal_reason || ""}` })
+  );
+
+  return el("div", { class: "card" }, children);
 }
 
 async function renderSettings() {

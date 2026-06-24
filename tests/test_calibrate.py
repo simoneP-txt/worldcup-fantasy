@@ -36,6 +36,40 @@ def test_fit_club_weight_prefers_the_better_signal():
     assert calibrate.fit_club_weight(club, price_prior, observed) == pytest.approx(1.0)
 
 
+def test_fit_club_weight_keeps_price_when_club_only_adds_noise():
+    # Price already tracks observed; club is pure noise -> the corr-first
+    # selector should not lean on the club projection.
+    observed = pd.Series([2.0, 4.0, 6.0, 8.0, 10.0, 3.0, 7.0])
+    price_prior = observed.copy()
+    club = pd.Series([7.0, 1.0, 9.0, 2.0, 5.0, 8.0, 0.0])
+    assert calibrate.fit_club_weight(club, price_prior, observed) == pytest.approx(0.0)
+
+
+def test_is_improvement_accepts_a_clear_win():
+    base = {"mae": 2.0, "bias": -0.5, "corr": 0.30}
+    refit = {"mae": 1.8, "bias": 0.0, "corr": 0.34}
+    assert calibrate.is_improvement(refit, base)
+
+
+def test_is_improvement_rejects_a_corr_regression():
+    # Lower mae but worse ranking: the optimizer cares about ordering.
+    base = {"mae": 2.0, "corr": 0.30}
+    refit = {"mae": 1.5, "corr": 0.25}
+    assert not calibrate.is_improvement(refit, base)
+
+
+def test_is_improvement_rejects_a_bias_only_fit():
+    # The real round-1 shape: least squares zeroes the bias but raises mae
+    # while corr is flat -> nothing that changes player ordering, so reject.
+    base = {"mae": 1.965, "bias": -0.549, "corr": 0.305}
+    refit = {"mae": 2.128, "bias": -0.0, "corr": 0.305}
+    assert not calibrate.is_improvement(refit, base)
+
+
+def test_is_improvement_needs_both_metrics():
+    assert not calibrate.is_improvement({"mae": 1.0}, {"mae": 2.0, "corr": 0.3})
+
+
 def test_metrics_zero_error_for_a_perfect_prediction():
     s = pd.Series([1.0, 2.0, 3.0, 4.0])
     m = calibrate.metrics(s, s)

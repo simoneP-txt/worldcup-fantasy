@@ -20,7 +20,7 @@ import pandas as pd
 
 from .. import fixtures, rules
 from ..state import TeamState
-from .squad import SquadSolution
+from .squad import BENCH_WEIGHT, SquadSolution
 
 
 def vice_captain(df: pd.DataFrame, solution: SquadSolution) -> int:
@@ -30,13 +30,128 @@ def vice_captain(df: pd.DataFrame, solution: SquadSolution) -> int:
 
 
 def ordered_bench(df: pd.DataFrame, solution: SquadSolution) -> tuple[list[int], int]:
-    """(outfield bench ids ordered 1st/2nd/3rd sub, bench GK id)."""
+    """(outfield bench ids ordered 1st/2nd/3rd sub, bench GK id).
+
+    Order is by EP: the bench order drives AUTO-subs (a DNP starter is replaced
+    at round end by the highest-order bench player who played), and all bench
+    players' minutes are known by then, so timing does not change it. The
+    timing/option value lives in retime_lineup, which decides who benches."""
     bench = df[
         df["id"].isin(set(solution.squad_ids) - set(solution.starter_ids))
     ].sort_values("ep_match", ascending=False)
     outfield = [int(i) for i in bench[bench["position"] != "GK"]["id"]]
     gk = int(bench[bench["position"] == "GK"]["id"].iloc[0])
     return outfield, gk
+
+
+# ----------------------------------------- temporal option-value of the XI
+# A bench player can be brought on LIVE only by removing a starter whose match
+# is already COMPLETE while the bench player has NOT yet kicked off. So a bench
+# player who plays LATE keeps that reactive-substitution option; one who plays
+# EARLY is auto-sub-only, and a strong EARLY player is better STARTED - his
+# points bank and you could not react to him on the bench anyway. This mirrors
+# the option-value captaincy. EP stays primary: the timing term only flips
+# genuinely close, same-position calls (it never benches a clearly better
+# player). Calibratable.
+#
+# The XI split is scored on THIS ROUND's ep_match, NOT the horizon-weighted
+# squad score the ILP uses: who you OWN is a horizon bet (handled in squad
+# selection), but who you START tonight only earns this round's points -
+# benching a player does not forfeit his future rounds (he starts them when
+# his fixture comes). Using the horizon here wrongly benched in-form players
+# from weaker nations (a shorter expected run dragged their score down).
+LINEUP_OPTION_WEIGHT = 0.10
+
+
+def _reactivity(squad: pd.DataFrame, kickoff: dict[int, object]) -> dict[int, float]:
+    """Per squad player, the fraction of his squad-mates who kick off BEFORE
+    him: how usable he is as a LIVE substitute (a late player can replace many
+    already-completed starters, an early one almost none). Unknown kickoff -> 0
+    so the timing term never moves a player we cannot place in time."""
+    times = {int(r["id"]): kickoff.get(int(r["squadId"])) for _, r in squad.iterrows()}
+    ids = list(times)
+    react: dict[int, float] = {}
+    for pid in ids:
+        t = times[pid]
+        if t is None or len(ids) < 2:
+            react[pid] = 0.0
+            continue
+        earlier = sum(1 for q in ids if q != pid and times[q] is not None and times[q] < t)
+        react[pid] = earlier / (len(ids) - 1)
+    return react
+
+
+def _start_premium(row, react: dict[int, float], option_weight: float) -> float:
+    """Start value of a player for THIS round: ep_match net of the bench credit,
+    minus the live-sub option a LATE player forfeits by starting, so close calls
+    favour the earlier one. ep = ep_match * (1 - BENCH_WEIGHT - option_weight *
+    reactivity). With option_weight 0 it ranks by ep_match (this round's points,
+    deliberately NOT the horizon-weighted squad score)."""
+    return float(row["ep_match"]) * (1.0 - BENCH_WEIGHT - option_weight * react.get(int(row["id"]), 0.0))
+
+
+def retime_lineup(
+    df: pd.DataFrame,
+    solution: SquadSolution,
+    rounds: list[dict],
+    next_round: int,
+    *,
+    option_weight: float = LINEUP_OPTION_WEIGHT,
+) -> list[tuple[int, int]]:
+    """Re-pick the starting XI of the solved squad for the live-sub option value
+    of kickoff order, MUTATING solution.starter_ids in place.
+
+    Keeps the ILP's formation (same starter count per position) and swaps only
+    WITHIN a position, so the lineup stays legal. Per position the highest
+    `_start_premium` players start; with option_weight 0 it picks the
+    this-round-EP-optimal XI for that formation (the horizon stays in squad
+    selection, not the start/bench split). The GK split is left untouched (a
+    keeper is auto-subbed only by the other keeper, so timing cannot help it).
+    Returns the (in_id, out_id) swaps.
+    """
+    rnd = next((r for r in rounds if r["id"] == next_round), None)
+    kickoff = fixtures.kickoffs_by_squad(rnd) if rnd else {}
+    squad = df[df["id"].isin(solution.squad_ids)]
+    react = _reactivity(squad, kickoff)
+
+    before = {int(i) for i in solution.starter_ids}
+    new_starters: list[int] = []
+    swaps: list[tuple[int, int]] = []
+    for pos, group in squad.groupby("position"):
+        rows = {int(r["id"]): r for _, r in group.iterrows()}
+        started_here = [i for i in rows if i in before]
+        k = len(started_here)
+        if pos == "GK" or k == 0 or k == len(rows):
+            new_starters.extend(started_here)
+            continue
+        ranked = sorted(rows, key=lambda i: _start_premium(rows[i], react, option_weight), reverse=True)
+        keep = ranked[:k]
+        new_starters.extend(keep)
+        moved_in = [i for i in keep if i not in before]
+        moved_out = [i for i in started_here if i not in keep]
+        swaps.extend(zip(moved_in, moved_out))
+
+    after = set(new_starters)
+    solution.starter_ids = [int(i) for i in solution.squad_ids if int(i) in after]
+    return swaps
+
+
+def lineup_timing_note(df: pd.DataFrame, swaps: list[tuple[int, int]]) -> str | None:
+    """Explain a timing-driven start/bench swap (the lineup analogue of
+    captain_timing_note). None when the EP-optimal XI already respects timing."""
+    if not swaps:
+        return None
+    names = df.set_index("id")["name"]
+    pairs = ", ".join(
+        f"{names.get(i, i)} (plays earlier) over {names.get(o, o)} (plays later)"
+        for i, o in swaps
+    )
+    return (
+        f"Timing/option value: start {pairs}. The EP is close, but an early "
+        "starter's points bank and you can't react to him; keeping the later "
+        "player on the bench preserves the live substitution (swap a completed "
+        "starter for him)."
+    )
 
 
 # --------------------------------------------------- option-value captaincy

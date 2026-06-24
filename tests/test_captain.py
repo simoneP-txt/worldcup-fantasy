@@ -2,11 +2,14 @@ import pandas as pd
 
 from wcfantasy.optimizer.captain import (
     _progressing_starters,
+    _reactivity,
     booster_advice,
     captain_timing_note,
+    lineup_timing_note,
     plan_captain,
     planned_activation,
     recommend_captain,
+    retime_lineup,
     sequential_captain_value,
 )
 from wcfantasy.optimizer.squad import SquadSolution
@@ -89,6 +92,91 @@ def test_captain_timing_note_explains_option_when_starting_earlier():
 def test_captain_timing_note_silent_when_best_plays_first():
     df = _df2(early_ep=7.0, late_ep=5.8)
     assert captain_timing_note(df, _solution(1, df), ROUNDS, 1) is None
+
+
+# ------------------------------------------ temporal option-value of the XI
+
+def _lineup_rounds() -> list[dict]:
+    """Round whose kickoffs put squad 1 EARLIEST and squad 2 LATEST, with the
+    rest squeezed in between (all on 06-14)."""
+    dates = {1: "2026-06-11T20:00:00+01:00", 2: "2026-06-20T20:00:00+01:00"}
+    for k, sq in enumerate([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]):
+        dates[sq] = f"2026-06-14T{10 + k:02d}:00:00+01:00"
+    matches = [{"homeSquadId": sq, "awaySquadId": 99, "date": d} for sq, d in dates.items()]
+    return [{"id": 1, "tournaments": matches}]
+
+
+def _lineup_df() -> pd.DataFrame:
+    """13-man squad. Two near-tied MIDs contest the 4th midfield slot: id1
+    (Early, ep 4.79, squad 1 plays first) and id2 (Late, ep 4.91, squad 2 plays
+    last). ep_horizon == ep_match so the ILP score is just the EP."""
+    rows = [
+        {"id": 1, "name": "Early Mid", "squadId": 1, "position": "MID", "ep_match": 4.79},
+        {"id": 2, "name": "Late Mid", "squadId": 2, "position": "MID", "ep_match": 4.91},
+        {"id": 3, "name": "Mid3", "squadId": 3, "position": "MID", "ep_match": 8.0},
+        {"id": 4, "name": "Mid4", "squadId": 4, "position": "MID", "ep_match": 7.0},
+        {"id": 5, "name": "Mid5", "squadId": 5, "position": "MID", "ep_match": 6.0},
+        {"id": 10, "name": "GK1", "squadId": 6, "position": "GK", "ep_match": 4.0},
+        {"id": 11, "name": "GK2", "squadId": 7, "position": "GK", "ep_match": 3.0},
+        {"id": 20, "name": "Def1", "squadId": 8, "position": "DEF", "ep_match": 5.0},
+        {"id": 21, "name": "Def2", "squadId": 9, "position": "DEF", "ep_match": 5.0},
+        {"id": 22, "name": "Def3", "squadId": 10, "position": "DEF", "ep_match": 5.0},
+        {"id": 30, "name": "Fwd1", "squadId": 11, "position": "FWD", "ep_match": 6.0},
+        {"id": 31, "name": "Fwd2", "squadId": 12, "position": "FWD", "ep_match": 6.0},
+        {"id": 32, "name": "Fwd3", "squadId": 13, "position": "FWD", "ep_match": 6.0},
+    ]
+    df = pd.DataFrame(rows)
+    df["ep_horizon"] = df["ep_match"]
+    return df
+
+
+def _lineup_solution() -> SquadSolution:
+    # EP-optimal XI: the late MID (id2) starts, the early MID (id1) is benched.
+    squad = [1, 2, 3, 4, 5, 10, 11, 20, 21, 22, 30, 31, 32]
+    starters = [10, 20, 21, 22, 2, 3, 4, 5, 30, 31, 32]
+    return SquadSolution(squad, starters, 3, 0.0, 0.0)
+
+
+def test_reactivity_is_zero_for_earliest_one_for_latest():
+    df = _lineup_df()
+    from wcfantasy import fixtures
+    kick = fixtures.kickoffs_by_squad(_lineup_rounds()[0])
+    react = _reactivity(df, kick)
+    assert react[1] == 0.0          # squad 1 plays first: nobody before him
+    assert react[2] == max(react.values()) and react[2] > 0.9  # squad 2 last
+
+
+def test_retime_starts_the_early_player_over_a_close_later_one():
+    df, sol = _lineup_df(), _lineup_solution()
+    swaps = retime_lineup(df, sol, _lineup_rounds(), 1)
+    assert (1, 2) in swaps                 # early in, late out
+    assert 1 in sol.starter_ids and 2 not in sol.starter_ids
+    # formation preserved: still 4 midfielders starting
+    mids = df[df["id"].isin(sol.starter_ids) & (df["position"] == "MID")]
+    assert len(mids) == 4
+
+
+def test_retime_is_a_noop_with_zero_option_weight():
+    df, sol = _lineup_df(), _lineup_solution()
+    before = set(sol.starter_ids)
+    swaps = retime_lineup(df, sol, _lineup_rounds(), 1, option_weight=0.0)
+    assert swaps == [] and set(sol.starter_ids) == before  # EP order untouched
+
+
+def test_retime_does_not_bench_a_clearly_better_late_player():
+    # Late MID is far stronger (8.0 vs 4.79): no timing premium should bench it.
+    df, sol = _lineup_df(), _lineup_solution()
+    df.loc[df["id"] == 2, "ep_match"] = 8.0
+    df.loc[df["id"] == 2, "ep_horizon"] = 8.0
+    retime_lineup(df, sol, _lineup_rounds(), 1)
+    assert 2 in sol.starter_ids
+
+
+def test_lineup_timing_note_mentions_both_players_or_is_none():
+    df = _lineup_df()
+    assert lineup_timing_note(df, []) is None
+    note = lineup_timing_note(df, [(1, 2)])
+    assert note and "Early Mid" in note and "Late Mid" in note
 
 
 # ----------------------------------------------------- progressing starters

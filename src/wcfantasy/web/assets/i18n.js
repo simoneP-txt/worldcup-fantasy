@@ -144,6 +144,7 @@ export const I18N = {
     "calibrate.beforeMetrics": "Default prior vs observed",
     "calibrate.refitMetrics": "Refit prior vs observed",
     "calibrate.clubBlend": "Best club/price blend",
+    "calibrate.rejected": "Not proposed (kept the default):",
 
     "settings.title": "Settings",
     "settings.language": "Language",
@@ -301,6 +302,7 @@ export const I18N = {
     "calibrate.beforeMetrics": "Prior di default vs osservato",
     "calibrate.refitMetrics": "Prior ricalibrato vs osservato",
     "calibrate.clubBlend": "Miglior blend club/prezzo",
+    "calibrate.rejected": "Non proposto (tenuto il default):",
 
     "settings.title": "Impostazioni",
     "settings.language": "Lingua",

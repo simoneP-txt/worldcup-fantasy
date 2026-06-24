@@ -48,6 +48,7 @@ class AdvicePlan:
     captain: dict = field(default_factory=dict)
     vice: dict = field(default_factory=dict)
     captain_timing_note: str | None = None
+    lineup_timing_note: str | None = None
     bench_order: list[dict] = field(default_factory=list)
     bench_gk: dict = field(default_factory=dict)
     transfers: dict | None = None
@@ -559,6 +560,13 @@ def compute_advice(
             "carry_note": carry_note,
         }
 
+    # Temporal option-value of the XI: a bench player can be brought on live
+    # only while he has not kicked off yet, so a strong EARLY starter belongs
+    # in the XI (his points bank and you can't react to him) and the bench is
+    # better kept for LATER players (the live-sub option survives). Re-pick the
+    # XI within the ILP's formation BEFORE captain/vice/bench follow from it.
+    lineup_swaps = captain_mod.retime_lineup(df, solution, rounds, rnd)
+
     # Option-value captaincy: the armband is switchable live (completed ->
     # not-yet-played), so captaining the EARLIEST strong starter first and
     # rolling it to a later, higher-EP one if he disappoints banks the better
@@ -571,6 +579,7 @@ def compute_advice(
     bench_order, bench_gk = captain_mod.ordered_bench(df, solution)
     squad_rows = _squad_rows(df, solution, vice_id, bench_order, bench_gk)
     timing = captain_mod.captain_timing_note(df, solution, rounds, rnd)
+    lineup_note = captain_mod.lineup_timing_note(df, lineup_swaps)
 
     doubtful = df[
         df["id"].isin(solution.squad_ids) & (df["p_play"] < 0.75)
@@ -625,6 +634,7 @@ def compute_advice(
         captain={"id": int(solution.captain_id), "name": str(names[solution.captain_id])},
         vice={"id": int(vice_id), "name": str(names[vice_id])},
         captain_timing_note=timing,
+        lineup_timing_note=lineup_note,
         bench_order=[{"id": int(i), "name": str(names[i])} for i in bench_order],
         bench_gk={"id": int(bench_gk), "name": str(names[bench_gk])},
         transfers=transfers_info,
@@ -704,6 +714,8 @@ def _print_advice(plan: AdvicePlan) -> None:
     console.print(f"  - Vice-captain: [bold]{plan.vice['name']}[/bold]")
     if plan.captain_timing_note:
         console.print(f"  - {plan.captain_timing_note}")
+    if plan.lineup_timing_note:
+        console.print(f"  - {plan.lineup_timing_note}")
     subs = ", ".join(f"{k+1}) {b['name']}" for k, b in enumerate(plan.bench_order))
     console.print(f"  - Bench order: {subs} | GK: {plan.bench_gk['name']}")
 
