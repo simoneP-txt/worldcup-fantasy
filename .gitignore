@@ -17,3 +17,7 @@ CLAUDE.md
 .claude
 archived_files/
 CALIBRATION.md
+
+# LaTeX documentation build material: only the final root PDF is tracked.
+docs/
+!/worldcup-fantasy-documentation.pdf
