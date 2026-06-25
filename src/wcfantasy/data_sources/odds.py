@@ -62,14 +62,23 @@ def _get(path: str, cache, **params) -> list | None:
 
 
 def _world_cup_sport_keys() -> tuple[str | None, str | None]:
-    """(h2h sport key, outright sport key) discovered from the API."""
+    """(h2h sport key, outright sport key) for the men's FIFA World Cup.
+
+    The key must be the MEN'S NATIONAL World Cup, not just anything with
+    'world_cup' in it: the cricket/rugby world cups, the FIFA Club World Cup,
+    the women's tournament and the qualifiers all share that substring. The
+    cricket key was being picked for the h2h market (which then returned 0
+    soccer fixtures), so restrict to the `soccer_fifa_world_cup` family - it
+    covers both the match and the `_winner` markets and tolerates a year
+    suffix - and drop the women's and qualifier variants.
+    """
     sports = _get("/sports", EXTERNAL_DIR / "odds_sports.json", all="true")
     if not sports:
         return None, None
     h2h = outright = None
     for s in sports:
         k = s["key"]
-        if "world_cup" not in k or "women" in k:
+        if not k.startswith("soccer_fifa_world_cup") or "women" in k or "qualif" in k:
             continue
         if s.get("has_outrights") or "winner" in k:
             outright = outright or k

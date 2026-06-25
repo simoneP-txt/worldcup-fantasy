@@ -23,3 +23,25 @@ def test_match_team_overrides_and_fuzzy():
     assert odds.match_team("Ivory Coast", SQUADS) == 3
     assert odds.match_team("Netherland", SQUADS) == 4  # fuzzy
     assert odds.match_team("Atlantis", SQUADS) is None
+
+
+def test_world_cup_sport_keys_picks_soccer_not_cricket(monkeypatch):
+    # cricket is FIRST in the list: the old "world_cup in key" filter grabbed
+    # it for the h2h market. The fix must pick the men's soccer World Cup.
+    sports = [
+        {"key": "cricket_icc_world_cup", "has_outrights": False},
+        {"key": "rugbyleague_world_cup", "has_outrights": False},
+        {"key": "soccer_fifa_club_world_cup", "has_outrights": False},
+        {"key": "soccer_fifa_world_cup_women", "has_outrights": False},
+        {"key": "soccer_fifa_world_cup_winner", "has_outrights": True},
+        {"key": "soccer_fifa_world_cup", "has_outrights": False},
+    ]
+    monkeypatch.setattr(odds, "_get", lambda *a, **k: sports)
+    h2h, outright = odds._world_cup_sport_keys()
+    assert h2h == "soccer_fifa_world_cup"
+    assert outright == "soccer_fifa_world_cup_winner"
+
+
+def test_world_cup_sport_keys_none_when_no_sport_list(monkeypatch):
+    monkeypatch.setattr(odds, "_get", lambda *a, **k: None)
+    assert odds._world_cup_sport_keys() == (None, None)
