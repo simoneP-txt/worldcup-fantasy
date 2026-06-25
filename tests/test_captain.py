@@ -5,6 +5,7 @@ from wcfantasy.optimizer.captain import (
     _reactivity,
     booster_advice,
     captain_timing_note,
+    clean_sheet_shield_advice,
     lineup_timing_note,
     plan_captain,
     planned_activation,
@@ -252,6 +253,26 @@ def test_max_captain_activates_when_no_higher_priority_booster():
     df = _squad_df(cap_ep=8.0, future=1.0, n_dead=0)
     lines = booster_advice(df, TeamState(), _full_solution(), next_round=6)
     assert any(l.startswith("ACTIVATE Maximum Captain") for l in lines)
+
+
+def test_clean_sheet_shield_advised_in_knockout_with_a_block():
+    # KO round, full GK/DEF/MID block: the shield is a candidate.
+    df = _squad_df(future=2.0)
+    lines = booster_advice(df, TeamState(), _full_solution(), next_round=5)
+    assert any("Clean Sheet Shield candidate" in l for l in lines)
+
+
+def test_clean_sheet_shield_silent_before_the_knockouts():
+    df = _squad_df(future=2.0)
+    lines = booster_advice(df, TeamState(), _full_solution(), next_round=3)
+    assert not any("Clean Sheet Shield" in l for l in lines)
+
+
+def test_clean_sheet_shield_advice_counts_only_gk_def_mid():
+    # 1 GK (5) + 4 DEF (20) + 5 MID (5) among the 11 starters = 30 at stake.
+    df = _squad_df(future=2.0)
+    note = clean_sheet_shield_advice(df, _full_solution())
+    assert "30 pts at stake" in note and "Clean Sheet Shield candidate" in note
 
 
 def test_planned_activation_priority_order():

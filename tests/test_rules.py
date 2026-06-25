@@ -32,8 +32,23 @@ def test_booster_constraints():
     assert rules.IRREVERSIBLE_BOOSTERS == ("wildcard",)
     assert rules.QUALIFICATION_BOOSTER_ROUNDS == (4, 5, 6, 7, 8)
     assert set(rules.BOOSTERS) == {
-        "maximum_captain", "twelfth_man", "wildcard", "qualification", "mystery"
+        "maximum_captain", "twelfth_man", "wildcard", "qualification",
+        "clean_sheet_shield",
     }
+    # the revealed Mystery booster: knockout only, legacy name still resolves
+    assert rules.CLEAN_SHEET_SHIELD_ROUNDS == (4, 5, 6, 7, 8)
+    assert rules.BOOSTER_ALIASES["mystery"] == "clean_sheet_shield"
+
+
+def test_clean_sheet_shield_scoring():
+    # Normally the first goal conceded loses the clean sheet; the shield keeps
+    # it until the second. FWD never earn it.
+    assert rules.clean_sheet_points("DEF", 0) == 5
+    assert rules.clean_sheet_points("DEF", 1) == 0
+    assert rules.clean_sheet_points("DEF", 1, shield=True) == 5
+    assert rules.clean_sheet_points("DEF", 2, shield=True) == 0
+    assert rules.clean_sheet_points("MID", 1, shield=True) == 1
+    assert rules.clean_sheet_points("FWD", 0, shield=True) == 0
 
 
 def test_scoring_table():

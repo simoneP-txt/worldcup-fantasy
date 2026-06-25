@@ -843,6 +843,7 @@ def use_booster_result(name: str | None) -> dict:
             "available": list(rules.BOOSTERS),
         }
     key = name.strip().lower().replace("-", "_")
+    key = rules.BOOSTER_ALIASES.get(key, key)  # legacy 'mystery' -> revealed name
     if key not in rules.BOOSTERS:
         return {
             "status": "usage",

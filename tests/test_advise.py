@@ -118,3 +118,7 @@ def test_use_booster_records_dedups_and_rejects_unknown(monkeypatch, tmp_path):
     assert state.load().boosters_used == ["wildcard", "maximum_captain"]
     advise.use_booster("nonsense")  # unknown booster ignored
     assert state.load().boosters_used == ["wildcard", "maximum_captain"]
+    advise.use_booster("mystery")  # legacy alias -> revealed name
+    assert state.load().boosters_used == [
+        "wildcard", "maximum_captain", "clean_sheet_shield"
+    ]

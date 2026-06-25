@@ -476,10 +476,37 @@ def booster_advice(
             f"{pick['ep_match']:.1f} EP) - no budget or country limits, "
             "pick is locked for the round once it starts."
         )
-    if "mystery" in unused and next_round >= rules.MYSTERY_AVAILABLE_FROM_ROUND:
-        advice.append(
-            "Mystery Booster: revealed now that the R32 is open; usable in "
-            "one KO round incl. the final. Re-evaluate on its actual effect."
-        )
+    if "clean_sheet_shield" in unused and next_round in rules.CLEAN_SHEET_SHIELD_ROUNDS:
+        advice.append(clean_sheet_shield_advice(df, solution))
 
     return advice or ["No booster this round: no standout opportunity."]
+
+
+def clean_sheet_shield_advice(df: pd.DataFrame, solution: SquadSolution) -> str:
+    """Assess the Clean Sheet Shield for the round: it keeps the clean-sheet
+    bonus of your GK/DEF/MID until a SECOND goal, so its value is the points
+    those starters would otherwise lose to a single goal, weighted by P(the
+    team concedes exactly one). Recommend it for the KO round with the biggest,
+    most concentrated defensive block (correlated clean sheets pay together)."""
+    starters = df[df["id"].isin(solution.starter_ids)]
+    block = starters[starters["position"].isin(["GK", "DEF", "MID"])].copy()
+    if block.empty:
+        return "HOLD Clean Sheet Shield: no clean-sheet starters this round."
+    cs = block["position"].map(rules.CLEAN_SHEET_POINTS).astype(float)
+    p_play = block["p_play"].fillna(1.0) if "p_play" in block.columns else 1.0
+    at_stake = float((cs * p_play).sum())
+    ev = at_stake * rules.CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB
+    by_team = block.groupby("squadName")["id"].count().sort_values(ascending=False)
+    top_team, top_n = by_team.index[0], int(by_team.iloc[0])
+
+    if ev >= rules.CLEAN_SHEET_SHIELD_MIN_EV:
+        return (
+            f"Clean Sheet Shield candidate: {len(block)} clean-sheet starters "
+            f"(~{at_stake:.0f} pts at stake, ~+{ev:.1f} EV if a team concedes "
+            f"exactly one), led by {top_team} ({top_n}). Use it in the KO round "
+            "with your strongest, most favoured defensive block."
+        )
+    return (
+        f"HOLD Clean Sheet Shield: only ~+{ev:.1f} EV this round; save it for a "
+        "KO round where you start more defenders from a favoured side."
+    )

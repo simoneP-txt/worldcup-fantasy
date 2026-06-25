@@ -107,9 +107,12 @@ BOOSTERS = {
         "knockout round or wins the final (needs >= 1 minute played; the "
         "captain's +2 is NOT doubled). Knockout stage only"
     ),
-    "mystery": (
-        "Revealed when round 3 locks and the R32 opens; usable in one "
-        "knockout round, Final included"
+    "clean_sheet_shield": (
+        "Knockout stage only: your goalkeeper, defenders and midfielders keep "
+        "the clean-sheet bonus until their team concedes a SECOND goal "
+        "(normally the first goal conceded already loses it). One knockout "
+        "round, Final included. Revealed when the R32 opened (formerly the "
+        "hidden 'Mystery' booster)."
     ),
 }
 MAX_BOOSTERS_PER_ROUND = 1
@@ -118,7 +121,23 @@ WILDCARD_EXCLUDED_ROUNDS = (1, 4)
 QUALIFICATION_BOOSTER_ROUNDS = (4, 5, 6, 7, 8)  # knockout only
 QUALIFICATION_BONUS = 2
 QUALIFICATION_MIN_MINUTES = 1
-MYSTERY_AVAILABLE_FROM_ROUND = 4
+
+# Clean Sheet Shield (revealed when the R32 opened; formerly the hidden
+# "Mystery" booster). Knockout stage only: a player's clean-sheet bonus
+# survives until his team concedes a SECOND goal.
+CLEAN_SHEET_SHIELD_ROUNDS = (4, 5, 6, 7, 8)
+CLEAN_SHEET_SHIELD_AVAILABLE_FROM_ROUND = 4
+CLEAN_SHEET_SHIELD_GOALS_ALLOWED = 1
+# Rough P(a team concedes EXACTLY one goal) in a knockout tie - the scenario
+# the shield converts into a clean sheet. Calibratable once KO results accrue.
+CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB = 0.30
+# Minimum one-round EV (clean-sheet pts saved x that probability) worth a
+# "candidate" call rather than holding the shield for a stronger round.
+CLEAN_SHEET_SHIELD_MIN_EV = 2.5
+
+# Old booster keys mapped onto a renamed one, so a recorded/typed legacy
+# name still resolves after the Mystery reveal.
+BOOSTER_ALIASES = {"mystery": "clean_sheet_shield"}
 
 # --------------------------------------------------------------- scoring
 
@@ -142,6 +161,15 @@ GOAL_POINTS = {"GK": 9, "DEF": 7, "MID": 6, "FWD": 5}
 CLEAN_SHEET_POINTS = {"GK": 5, "DEF": 5, "MID": 1, "FWD": 0}
 # GK and DEF: first goal conceded is free, each additional one is -1.
 GOAL_CONCEDED_AFTER_FIRST = -1
+
+
+def clean_sheet_points(position: str, goals_conceded: int, *, shield: bool = False) -> int:
+    """Clean-sheet points for a player who played 60+ minutes. The bonus is
+    normally lost on the FIRST goal conceded; with the Clean Sheet Shield
+    booster active it survives until the second
+    (CLEAN_SHEET_SHIELD_GOALS_ALLOWED). FWD always score 0."""
+    allowed = CLEAN_SHEET_SHIELD_GOALS_ALLOWED if shield else 0
+    return CLEAN_SHEET_POINTS.get(position, 0) if goals_conceded <= allowed else 0
 PENALTY_SAVE_POINTS = 3  # GK, shootouts excluded
 SAVES_PER_POINT = 3      # GK: +1 every 3 saves
 TACKLES_PER_POINT = 3    # MID: +1 every 3 tackles
