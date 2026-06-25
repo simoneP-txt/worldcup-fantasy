@@ -24,6 +24,10 @@ prints the moves to make by hand. It never logs into your FIFA account.
 - **Live:** after each match it advises captain swaps and substitutions, pricing in the
   auto-sub insurance you forfeit with the first manual change.
 
+The full technical documentation of how the code works, the data pipeline and the
+decision engine with the formulas and design trade-offs behind each choice, is in
+[worldcup-fantasy-documentation.pdf](worldcup-fantasy-documentation.pdf).
+
 ## Setup
 
 ```powershell
