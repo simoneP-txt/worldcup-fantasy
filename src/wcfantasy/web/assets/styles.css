@@ -271,6 +271,77 @@ main {
 }
 .move-callout { margin: 6px 0; }
 h3 .badge-ic { vertical-align: middle; margin-right: 8px; }
+.badge-ic.warn { background: #fff1da; color: var(--warn); }
+
+/* ---------- fixture cards (Live outlook + Plan schedule, shared) ---------- */
+.fixture-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 12px;
+}
+.fixture-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.fx-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 9px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.fx-time {
+  font-size: 12px; font-weight: 700; color: var(--primary);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.fx-time.tbd { color: var(--text-faint); font-weight: 600; }
+.fx-teams { display: flex; align-items: baseline; gap: 7px; font-size: 13.5px; font-weight: 600; }
+.fx-vs { color: var(--text-faint); font-size: 11px; font-weight: 500; text-transform: lowercase; }
+
+.fx-players { display: flex; flex-direction: column; }
+.fx-player {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--border);
+}
+.fx-player:first-child { border-top: 0; }
+.fx-player.dim { opacity: .58; }
+.fx-name { font-weight: 600; font-size: 13.5px; }
+.fx-player .badge-ic { width: 20px; height: 20px; font-size: 11px; }
+.fx-play { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.fx-pct { font-size: 12px; color: var(--text-soft); font-variant-numeric: tabular-nums; min-width: 30px; text-align: right; }
+
+.role-chip { padding: 1px 8px; }
+.role-chip.xi { background: var(--primary-tint); color: var(--primary); }
+.role-chip.bench { background: var(--surface-2); color: var(--text-faint); }
+
+.playbar.warn > span { background: var(--warn); }
+
+/* ---------- availability watch ---------- */
+.avail-list { display: flex; flex-direction: column; gap: 2px; }
+.avail-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 10px; border-radius: var(--radius-sm);
+  border-left: 3px solid var(--warn); background: #fffaf0;
+}
+.avail-row .team-chip::before { content: "· "; color: var(--text-faint); }
+
+/* ---------- booster advice rows ---------- */
+.booster-list { display: flex; flex-direction: column; gap: 8px; }
+.booster-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 9px 12px; border-radius: var(--radius-sm);
+  border-left: 3px solid var(--border-strong); background: var(--surface);
+}
+.booster-row .booster-text { font-size: 13px; line-height: 1.45; }
+.booster-row .badge-ic { background: var(--surface-2); color: var(--text-soft); }
+.booster-row.activate { border-left-color: var(--ok); background: #eef8f1; }
+.booster-row.activate .badge-ic { background: #e9f7ef; color: var(--ok); }
+.booster-row.activate .booster-text { color: #1c5538; }
+.booster-row.hold { border-left-color: var(--border-strong); opacity: .85; }
+.booster-row.candidate { border-left-color: var(--primary); background: var(--primary-tint); }
+.booster-row.candidate .badge-ic { background: #fff; color: var(--primary); }
 
 /* ---------- tables ---------- */
 table.data { width: 100%; border-collapse: collapse; font-size: 14px; }

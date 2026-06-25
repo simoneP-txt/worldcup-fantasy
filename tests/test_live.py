@@ -181,6 +181,52 @@ def test_round_outlook_lists_only_players_still_to_play(squad_df, team):
     assert all("to play" in line for line in lines)
 
 
+def test_round_outlook_matches_groups_by_fixture(squad_df, team):
+    # captain id 11 (squad 11), vice id 10 (squad 10), bench id 12 (squad 12)
+    squad_df = squad_df.assign(price=6.0, percentSelected=10.0)
+    rnd = {"id": 1, "tournaments": [
+        {"homeSquadId": 1, "awaySquadId": 12, "homeSquadName": "team1",
+         "awaySquadName": "team12", "date": "2026-06-12T20:00:00+01:00",
+         "status": "scheduled"},
+        {"homeSquadId": 10, "awaySquadId": 11, "homeSquadName": "team10",
+         "awaySquadName": "team11", "date": "2026-06-11T20:00:00+01:00",
+         "status": "scheduled"},
+    ]}
+    kickoffs = live.round_kickoffs(rnd)
+    matches = live.round_outlook_matches(
+        squad_df, team, rnd, availability=None, kickoffs=kickoffs
+    )
+    # chronological: the 10-11 match (11 Jun) precedes the 1-12 match (12 Jun)
+    assert [m["home"] for m in matches] == ["team10", "team1"]
+    assert matches[0]["away"] == "team11"
+    assert matches[0]["kickoff"].endswith("21:00")  # CEST = +02:00
+    cap = next(p for m in matches for p in m["players"] if p["name"] == "p11")
+    assert cap["is_captain"] and cap["role"] == "XI"
+    vice = next(p for m in matches for p in m["players"] if p["name"] == "p10")
+    assert vice["is_vice"]
+    sub = next(p for m in matches for p in m["players"] if p["name"] == "p12")
+    assert sub["role"] == "bench"
+    assert all("p_play" in p for m in matches for p in m["players"])
+
+
+def test_round_outlook_matches_skips_played_fixtures(squad_df, team):
+    squad_df = squad_df.assign(price=6.0, percentSelected=10.0)
+    rnd = {"id": 1, "tournaments": [
+        {"homeSquadId": 1, "awaySquadId": 2, "homeSquadName": "team1",
+         "awaySquadName": "team2", "date": "2026-06-11T20:00:00+01:00",
+         "status": "complete", "homeScore": 1, "awayScore": 0},
+        {"homeSquadId": 3, "awaySquadId": 4, "homeSquadName": "team3",
+         "awaySquadName": "team4", "date": "2026-06-12T20:00:00+01:00",
+         "status": "scheduled"},
+    ]}
+    kickoffs = live.round_kickoffs(rnd)
+    matches = live.round_outlook_matches(
+        squad_df, team, rnd, availability=None, kickoffs=kickoffs
+    )
+    # only the still-to-play fixture survives
+    assert len(matches) == 1 and matches[0]["home"] == "team3"
+
+
 def test_round_outlook_discounts_an_injured_player(squad_df, team):
     squad_df = squad_df.assign(price=6.0, percentSelected=10.0)
     phases = {i: "scheduled" for i in range(1, 16)}

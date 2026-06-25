@@ -55,6 +55,10 @@ class LiveState:
     captain_lines: list[str] = field(default_factory=list)
     sub_lines: list[str] = field(default_factory=list)
     outlook_lines: list[str] = field(default_factory=list)
+    # Structured sibling of `outlook_lines`: my still-to-play players grouped
+    # by their upcoming fixture, so the web can render fixture cards (the text
+    # lines stay for the CLI and as a backward-compatible fallback).
+    outlook: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -451,6 +455,65 @@ def round_outlook(
     return lines
 
 
+def round_outlook_matches(
+    df,
+    team: state.TeamState,
+    rnd: dict,
+    availability: dict[int, float] | None,
+    kickoffs: dict[int, datetime] | None = None,
+    observed_starts: dict[int, float] | None = None,
+) -> list[dict]:
+    """Structured sibling of `round_outlook`: my players still to play this
+    round, grouped BY their upcoming fixture in chronological order.
+
+    Same P(plays) basis as the text outlook, but each match carries the
+    opponent and kickoff so the web can render the same fixture cards the Plan
+    schedule uses. The kickoff is pre-formatted in Italian local time to match
+    that schedule (None when the date is still TBD). `outlook_lines` stays the
+    per-player text fallback for the CLI."""
+    by_id = df.set_index("id")
+    p_play = player_points.starter_probability(df, availability, observed_starts)
+    p_play.index = df["id"]
+
+    matches: list[dict] = []
+    for m in rnd.get("tournaments", []):
+        if match_phase(m) != "scheduled":
+            continue  # already played or playing now
+        squad_ids = {m.get("homeSquadId"), m.get("awaySquadId")}
+        players = []
+        for pid in team.player_ids:
+            if pid not in by_id.index:
+                continue
+            if int(by_id.loc[pid, "squadId"]) not in squad_ids:
+                continue
+            row = by_id.loc[pid]
+            players.append({
+                "name": str(row["name"]),
+                "team": str(row["squadName"]),
+                "position": str(row["position"]),
+                "role": "XI" if pid in team.starters else "bench",
+                "p_play": round(float(p_play[pid]), 4),
+                "is_captain": pid == team.captain_id,
+                "is_vice": pid == team.vice_captain_id,
+            })
+        if not players:
+            continue
+        players.sort(key=lambda p: (p["role"] != "XI", -p["p_play"], p["name"]))
+        when = (kickoffs or {}).get(m.get("homeSquadId")) or (
+            kickoffs or {}).get(m.get("awaySquadId"))
+        matches.append({
+            "kickoff": f"{_rome(when):%a %d %b %H:%M}" if when else None,
+            "_when": when,
+            "home": str(m.get("homeSquadName") or "?"),
+            "away": str(m.get("awaySquadName") or "?"),
+            "players": players,
+        })
+    matches.sort(key=lambda mt: mt["_when"] or datetime.max.replace(tzinfo=timezone.utc))
+    for mt in matches:
+        mt.pop("_when", None)
+    return matches
+
+
 def lineup_set_for_future_round(team_round_no: int, live_round_no: int) -> bool:
     """True when my_team.json was applied for a round AFTER the one being
     played now, so the saved XI is next round's plan, not what is actually
@@ -746,6 +809,7 @@ def compute_live_state(
     outlook_lines = round_outlook(df, team, phases, availability, kickoffs, observed) or [
         "All your players have already played this round."
     ]
+    outlook = round_outlook_matches(df, team, rnd, availability, kickoffs, observed)
 
     return LiveState(
         status="ok",
@@ -758,6 +822,7 @@ def compute_live_state(
         captain_lines=captain_lines,
         sub_lines=sub_lines,
         outlook_lines=outlook_lines,
+        outlook=outlook,
     )
 
 

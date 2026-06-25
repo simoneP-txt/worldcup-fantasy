@@ -43,6 +43,11 @@ export const I18N = {
     "role.benchGK": "Bench GK",
     "role.sub": "Sub",
 
+    "fixture.vs": "vs",
+    "fixture.tbd": "Date TBD",
+    "fixture.xi": "XI",
+    "fixture.bench": "Bench",
+
     "dashboard.title": "My team",
     "dashboard.empty": "No team saved. Open “Plan round”, run it, then record the moves.",
     "dashboard.feedsMissing": "No FIFA data downloaded yet. Run “Plan round” or “Fetch” first.",
@@ -200,6 +205,11 @@ export const I18N = {
     "role.bench": "Panchina",
     "role.benchGK": "Portiere riserva",
     "role.sub": "Sost.",
+
+    "fixture.vs": "vs",
+    "fixture.tbd": "Data da definire",
+    "fixture.xi": "Titolare",
+    "fixture.bench": "Panchina",
 
     "dashboard.title": "La mia squadra",
     "dashboard.empty": "Nessuna squadra salvata. Apri “Pianifica round”, esegui e poi registra le mosse.",

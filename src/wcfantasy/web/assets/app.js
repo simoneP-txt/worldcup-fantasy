@@ -166,6 +166,156 @@ function linesCard(title, lines, opts = {}) {
   ]);
 }
 
+// ----------------------------------------------------------------- fixture card
+// One reusable "fixture card" shared by the Live outlook and the Plan schedule,
+// so the two tabs look identical. A match is normalised to
+// { kickoff, home, away, players: [{ name, team, position, p_play,
+//   isStarter, isCaptain, isVice }] }.
+function captainViceBadge(p) {
+  if (p.isCaptain) return el("span", { class: "badge-ic cap sm", text: "C", title: t("role.CAPTAIN") });
+  if (p.isVice) return el("span", { class: "badge-ic vice sm", text: "V", title: t("role.VICE") });
+  return null;
+}
+
+function playBar(p_play, kind = "") {
+  const pct = p_play === null || p_play === undefined ? null : Math.round(p_play * 100);
+  return el("span", { class: "fx-play" }, [
+    el("span", { class: `playbar ${kind}` }, [el("span", { style: `width:${pct ?? 0}%` })]),
+    el("span", { class: "fx-pct", text: pct === null ? "—" : `${pct}%` }),
+  ]);
+}
+
+function fixturePlayerRow(p) {
+  const lowPlay = p.p_play !== null && p.p_play !== undefined && p.p_play < 0.5;
+  const dim = !p.isStarter || lowPlay;
+  return el("div", { class: `fx-player${dim ? " dim" : ""}` }, [
+    posChip(p.position),
+    el("span", { class: "fx-name", text: p.name }),
+    captainViceBadge(p),
+    p.team ? el("span", { class: "team-chip", text: p.team }) : null,
+    el("span", { class: "header-spacer" }),
+    el("span", { class: `chip role-chip ${p.isStarter ? "xi" : "bench"}`, text: p.isStarter ? t("fixture.xi") : t("fixture.bench") }),
+    playBar(p.p_play),
+  ]);
+}
+
+function fixtureCard(m) {
+  return el("div", { class: "fixture-card" }, [
+    el("div", { class: "fx-head" }, [
+      el("span", { class: `fx-time${m.kickoff ? "" : " tbd"}`, text: m.kickoff || t("fixture.tbd") }),
+      el("span", { class: "fx-teams" }, [
+        el("span", { class: "fx-team", text: m.home }),
+        el("span", { class: "fx-vs", text: t("fixture.vs") }),
+        el("span", { class: "fx-team", text: m.away }),
+      ]),
+    ]),
+    el("div", { class: "fx-players" }, m.players.map(fixturePlayerRow)),
+  ]);
+}
+
+// A titled section (icon header) whose body is a responsive grid of fixture
+// cards; falls back to plain note lines when there are no structured matches.
+function fixtureSection(badgeClass, badgeText, title, matches, fallbackLines) {
+  if ((!matches || !matches.length) && (!fallbackLines || !fallbackLines.length)) return null;
+  const body = matches && matches.length
+    ? el("div", { class: "fixture-grid" }, matches.map(fixtureCard))
+    : el("ul", { class: "lines note" }, fallbackLines.map((l) => el("li", { text: l })));
+  return el("div", { class: "card" }, [
+    el("h3", {}, [el("span", { class: `badge-ic ${badgeClass} sm`, text: badgeText }), title]),
+    body,
+  ]);
+}
+
+// Live payload -> normalised matches (roles arrive as "XI"/"bench").
+function liveOutlookMatches(state) {
+  return (state.outlook || []).map((m) => ({
+    kickoff: m.kickoff,
+    home: m.home,
+    away: m.away,
+    players: (m.players || []).map((p) => ({
+      name: p.name, team: p.team, position: p.position, p_play: p.p_play,
+      isStarter: p.role === "XI", isCaptain: !!p.is_captain, isVice: !!p.is_vice,
+    })),
+  }));
+}
+
+const STARTER_ROLES = new Set(["CAPTAIN", "VICE", "START"]);
+
+function stripCV(raw) {
+  const m = raw.match(/\s\(([CV])\)$/);
+  return m ? { name: raw.slice(0, m.index).trim(), mark: m[1] } : { name: raw.trim(), mark: null };
+}
+
+// Parse one advise schedule line "Sun 28 Jun 21:00  Home-Away: a (C), b".
+function parseScheduleLine(line) {
+  const colon = line.indexOf(": ");
+  if (colon === -1) return null;
+  const head = line.slice(0, colon);
+  const namesPart = line.slice(colon + 2);
+  const gap = head.indexOf("  ");           // two spaces split stamp / fixture
+  let kickoff = null, fixture = head;
+  if (gap !== -1) { kickoff = head.slice(0, gap).trim(); fixture = head.slice(gap + 2).trim(); }
+  if (kickoff === "date TBD") kickoff = null;
+  const dash = fixture.indexOf("-");
+  let home = fixture, away = "";
+  if (dash !== -1) { home = fixture.slice(0, dash).trim(); away = fixture.slice(dash + 1).trim(); }
+  const names = namesPart.split(", ").map((s) => s.trim()).filter(Boolean);
+  return { kickoff, home, away, names };
+}
+
+// Plan schedule -> the SAME normalised matches, joining each player on name
+// with plan.squad_rows for position / team / p_play / role (frontend-only).
+function planScheduleMatches(plan) {
+  const byName = new Map((plan.squad_rows || []).map((r) => [r.name, r]));
+  const matches = [];
+  for (const line of plan.schedule || []) {
+    const parsed = parseScheduleLine(line);
+    if (!parsed) continue;
+    const players = parsed.names.map((raw) => {
+      const { name, mark } = stripCV(raw);
+      const row = byName.get(name);
+      if (row) {
+        return {
+          name: row.name, team: row.team, position: row.position, p_play: row.p_play,
+          isStarter: STARTER_ROLES.has(row.role),
+          isCaptain: row.role === "CAPTAIN", isVice: row.role === "VICE",
+        };
+      }
+      return { name, team: "", position: "", p_play: null, isStarter: false,
+               isCaptain: mark === "C", isVice: mark === "V" };
+    });
+    matches.push({ kickoff: parsed.kickoff, home: parsed.home, away: parsed.away, players });
+  }
+  return matches;
+}
+
+// Availability-watch row: name + team + a warning-tinted P(plays) bar.
+function availRow(r) {
+  return el("div", { class: "avail-row" }, [
+    el("span", { class: "fx-name", text: r.name }),
+    el("span", { class: "team-chip", text: r.team }),
+    el("span", { class: "header-spacer" }),
+    playBar(r.p_play, "warn"),
+  ]);
+}
+
+// Booster line -> a row whose icon + accent reflect the leading verb.
+function boosterVerb(line) {
+  const s = (line || "").trim();
+  if (/^ACTIVATE\b/i.test(s)) return "activate";
+  if (/^HOLD\b/i.test(s)) return "hold";
+  if (/candidate/i.test(s) || /^Consider\b/i.test(s)) return "candidate";
+  return "neutral";
+}
+const BOOSTER_ICONS = { activate: "✓", hold: "✋", candidate: "★", neutral: "•" };
+function boosterRow(line) {
+  const verb = boosterVerb(line);
+  return el("div", { class: `booster-row ${verb}` }, [
+    el("span", { class: "badge-ic sm", text: BOOSTER_ICONS[verb] }),
+    el("span", { class: "booster-text", text: line }),
+  ]);
+}
+
 // ----------------------------------------------------------------- views
 const view = () => document.getElementById("view");
 
@@ -302,12 +452,11 @@ function planResultNode(plan, { applyable }) {
   // moves + captain (iconified, structured)
   frag.append(movesCardNode(plan));
 
-  // availability watch
+  // availability watch — styled rows with a warning-tinted P(plays) bar
   if (plan.availability_watch && plan.availability_watch.length) {
     frag.append(el("div", { class: "card" }, [
-      el("h3", { text: t("plan.availabilityWatch") }),
-      el("ul", { class: "lines" }, plan.availability_watch.map((r) =>
-        el("li", { text: `${r.name} (${r.team}): ${fmtPct(r.p_play)} ${t("plan.likelyToPlay")}` }))),
+      el("h3", {}, [el("span", { class: "badge-ic warn sm", text: "!" }), t("plan.availabilityWatch")]),
+      el("div", { class: "avail-list" }, plan.availability_watch.map(availRow)),
     ]));
   }
   // unverified starters
@@ -318,9 +467,18 @@ function planResultNode(plan, { applyable }) {
   if (plan.comparison && plan.comparison.length) {
     frag.append(linesCard(t("ideal.comparison"), plan.comparison));
   }
-  // booster + schedule
-  if (plan.booster_advice && plan.booster_advice.length) frag.append(linesCard(t("plan.boosterAdvice"), plan.booster_advice));
-  if (plan.schedule && plan.schedule.length) frag.append(linesCard(t("plan.schedule"), plan.schedule));
+  // booster advice — one accented row per line (ACTIVATE / HOLD / candidate)
+  if (plan.booster_advice && plan.booster_advice.length) {
+    frag.append(el("div", { class: "card" }, [
+      el("h3", {}, [el("span", { class: "badge-ic timing sm", text: "★" }), t("plan.boosterAdvice")]),
+      el("div", { class: "booster-list" }, plan.booster_advice.map(boosterRow)),
+    ]));
+  }
+  // your players' matches — the SAME fixture cards as the Live outlook
+  const scheduleMatches = planScheduleMatches(plan);
+  if (scheduleMatches.length) {
+    frag.append(fixtureSection("play", "⏱", t("plan.schedule"), scheduleMatches));
+  }
 
   // apply
   if (applyable && plan.applyable) {
@@ -392,7 +550,7 @@ function liveResultNode(state) {
   if (state.change_cost_note) frag.append(el("div", { class: "card" }, [el("div", { class: "callout", text: state.change_cost_note })]));
   frag.append(iconLinesCard("cap", "C", t("live.captain"), state.captain_lines));
   frag.append(iconLinesCard("swap", "⇄", t("live.subs"), state.sub_lines));
-  frag.append(iconLinesCard("play", "⏱", t("live.outlook"), state.outlook_lines));
+  frag.append(fixtureSection("play", "⏱", t("live.outlook"), liveOutlookMatches(state), state.outlook_lines));
   return frag;
 }
 
