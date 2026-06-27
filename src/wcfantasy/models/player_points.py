@@ -37,7 +37,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from .. import rules
+from .. import rules, tunables
 from ..config import EXTERNAL_DIR, STATE_DIR
 from ..data_sources import availability as availability_mod
 from ..data_sources import club_stats
@@ -281,6 +281,20 @@ def expected_points_per_match(
     return ep.mask(unavailable, 0.0)
 
 
+def _next_round_opponents(rounds: list[dict], next_round: int) -> dict[int, int]:
+    """{squadId -> opponent squadId} for next_round's fixtures (both directions)."""
+    rnd = next((r for r in rounds if r["id"] == next_round), None)
+    opponent: dict[int, int] = {}
+    if rnd is None:
+        return opponent
+    for m in rnd.get("tournaments", []):
+        h, a = m.get("homeSquadId"), m.get("awaySquadId")
+        if h is not None and a is not None:
+            opponent[h] = a
+            opponent[a] = h
+    return opponent
+
+
 def opponent_factor(
     players: pd.DataFrame,
     rounds: list[dict],
@@ -293,16 +307,9 @@ def opponent_factor(
     explicitly instead of reaching into another module's globals. 1.0
     everywhere when ratings are unavailable (offline fallback)."""
     neutral = pd.Series(1.0, index=players.index)
-    rnd = next((r for r in rounds if r["id"] == next_round), None)
-    if not ratings or rnd is None:
+    opponent = _next_round_opponents(rounds, next_round)
+    if not ratings or not opponent:
         return neutral
-
-    opponent: dict[int, int] = {}
-    for m in rnd.get("tournaments", []):
-        h, a = m.get("homeSquadId"), m.get("awaySquadId")
-        if h is not None and a is not None:
-            opponent[h] = a
-            opponent[a] = h
 
     def factor(squad_id: int) -> float:
         opp = opponent.get(squad_id)
@@ -312,6 +319,120 @@ def opponent_factor(
         return 1.0 + WEIGHTS["opponent_spread"] * (expected - 0.5)
 
     return players["squadId"].map(factor).astype(float)
+
+
+def clean_sheet_probability(expected_score: float, base_rate: float, spread: float) -> float:
+    """P(clean sheet) tilted around base_rate by the Elo expected score E in
+    [0, 1]: base*(1 + spread*(2E - 1)), clipped to [0, 1]. An even tie (E=0.5)
+    reads the base; a near-certain winner up to ~base*(1+spread), a near-certain
+    loser down to ~base*(1-spread). Replaces the flat rate for DEF/MID."""
+    return min(1.0, max(0.0, base_rate * (1.0 + spread * (2.0 * expected_score - 1.0))))
+
+
+def team_clean_sheet(
+    players: pd.DataFrame,
+    rounds: list[dict],
+    next_round: int,
+    ratings: dict[int, float] | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    """Per-player (P clean sheet, P concede exactly one) for next_round, by each
+    squad's opponent (Elo). Even or unknown fixtures fall back to the flat base
+    rate (WEIGHTS['flat_clean_sheet_rate']). P(concede exactly one) is the
+    Poisson value consistent with P(0)=p_cs: lambda = -ln(p_cs), P(1)=lambda*p_cs
+    - the scenario the Clean Sheet Shield converts into a clean sheet, so the
+    shield and the defensive EP share one opponent-aware model."""
+    base = WEIGHTS["flat_clean_sheet_rate"]
+    opponent = _next_round_opponents(rounds, next_round)
+
+    def pcs(squad_id) -> float:
+        opp = opponent.get(squad_id)
+        if not ratings or opp is None or squad_id not in ratings or opp not in ratings:
+            return base
+        expected = elo.expected_score(ratings[squad_id] - ratings[opp])
+        return clean_sheet_probability(
+            expected, base, tunables.tuned("clean_sheet_opponent_spread")
+        )
+
+    p_cs = players["squadId"].map(pcs).astype(float)
+    p_cs.index = players.index
+    lam = -np.log(p_cs.clip(lower=1e-6, upper=1.0))
+    p_one = (lam * p_cs).clip(lower=0.0, upper=1.0)
+    return p_cs, p_one
+
+
+def clean_sheet_adjustment(players: pd.DataFrame, p_cs: pd.Series) -> pd.Series:
+    """Opponent-aware clean-sheet correction (points) for DEF/MID - the
+    positions whose prior used the flat rate. (p_cs - base) * clean-sheet
+    points, 0 for GK (its prior already uses the keeper's own club CS rate) and
+    FWD (no CS points). It adds the defender-specific opponent tilt the blanket
+    opponent factor under-weights; 0 everywhere when ratings are unavailable
+    (p_cs == base)."""
+    base = WEIGHTS["flat_clean_sheet_rate"]
+    pts = players["position"].map(rules.CLEAN_SHEET_POINTS).fillna(0.0)
+    defmid = players["position"].isin(["DEF", "MID"]).astype(float)
+    return ((p_cs - base) * pts * defmid).astype(float)
+
+
+def fixture_adjusted_ep(
+    players: pd.DataFrame,
+    base: pd.Series,
+    rounds: list[dict],
+    next_round: int,
+    ratings: dict[int, float] | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    """Apply next-round fixture context to a per-match base EP: opponent
+    difficulty (opponent_factor) plus the DEF/MID clean-sheet tilt
+    (clean_sheet_adjustment). Returns (ep_match, p_concede_one).
+
+    Available players (base > 0) keep the 0.5 floor expected_points_per_match
+    uses; unavailable ones (base == 0) stay 0 - the clean-sheet tilt never
+    resurrects a ruled-out or eliminated player, and never drives a real starter
+    out of the ILP's ep_match>0 pool. Shared by advise (expected_value) and live
+    so the two value still-to-play players identically."""
+    p_cs, p_one = team_clean_sheet(players, rounds, next_round, ratings)
+    ep = base * opponent_factor(players, rounds, next_round, ratings)
+    ep = ep + clean_sheet_adjustment(players, p_cs).where(base > 0, 0.0)
+    ep = ep.where(base <= 0, ep.clip(lower=0.5))
+    return ep, p_one
+
+
+def ep_basis_and_confidence(
+    players: pd.DataFrame,
+    club_matched: pd.Series,
+    *,
+    full: float | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    """Per player, (basis label, confidence level) describing WHAT backs his EP.
+
+    The point estimate hides a stack of approximations whose strength varies by
+    player: observed WC minutes are firm, a club projection transferred to the
+    national team is a proxy, and a price-only prior is the weakest (no club
+    match, no minutes). This surfaces that so the user knows when to trust a
+    number. `full` is the matches needed for observed form to fully take over
+    (WEIGHTS['matches_for_full_form'] by default). No model decision reads these
+    columns - they are purely informational.
+    """
+    full = full if full is not None else WEIGHTS["matches_for_full_form"]
+    form_frac = (players["matchesPlayed"].astype(float).clip(upper=full) / full)
+    matched = club_matched.reindex(players.index).fillna(False).astype(bool)
+    basis, level = [], []
+    for frac, has_club in zip(form_frac, matched):
+        if frac >= 1.0:
+            basis.append("observed WC form"); level.append("high")
+        elif has_club and frac > 0:
+            basis.append("club proxy + partial form"); level.append("medium")
+        elif has_club:
+            basis.append("club proxy"); level.append("medium")
+        elif frac >= 0.5:
+            basis.append("partial WC form"); level.append("medium")
+        elif frac > 0:
+            basis.append("scant WC form + price prior"); level.append("low")
+        else:
+            basis.append("price prior only"); level.append("low")
+    return (
+        pd.Series(basis, index=players.index),
+        pd.Series(level, index=players.index),
+    )
 
 
 def expected_value(
@@ -345,7 +466,12 @@ def expected_value(
     )
     last_run_info["observed_start_ids"] = set(observed)
     base = expected_points_per_match(players, club_ep, availability, observed)
-    out["ep_match"] = base * opponent_factor(players, rounds, next_round, ratings)
+    # Next-round fixture context: opponent difficulty + the DEF/MID clean-sheet
+    # tilt (both Elo-driven), and the per-team P(concede exactly one) the Clean
+    # Sheet Shield advice reads.
+    ep_match, p_concede_one = fixture_adjusted_ep(players, base, rounds, next_round, ratings)
+    out["ep_match"] = ep_match
+    out["p_concede_one"] = p_concede_one
     out["future_rounds"] = out["squadId"].map(future).fillna(0.0)
     # P(team wins its next match), for the Qualification booster (advancing
     # ONE round, not going deep). Distinct from future_rounds on purpose.
@@ -354,4 +480,10 @@ def expected_value(
     # P(plays) for the report: depth chart x availability. The depth-chart
     # part scaled the prior; the availability part scaled the final EP.
     out["p_play"] = starter_probability(players, availability, observed)
+    # What backs each EP (observed form / club proxy / price-only): purely
+    # informational, so the user knows how much the number is leaning on
+    # approximations this round.
+    basis, confidence = ep_basis_and_confidence(players, club_ep.notna())
+    out["ep_basis"] = basis
+    out["ep_confidence"] = confidence
     return out

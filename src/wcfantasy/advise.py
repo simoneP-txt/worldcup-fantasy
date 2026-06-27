@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from rich.console import Console
 from rich.table import Table
 
-from . import feed_status, features, fifa_client, fixtures, rules, state
+from . import feed_status, features, fifa_client, fixtures, rules, state, tunables
 from .config import STATE_DIR
 from .data_sources import availability, odds
 from .models import player_points, progression
@@ -54,6 +54,7 @@ class AdvicePlan:
     transfers: dict | None = None
     moves: list[str] = field(default_factory=list)
     availability_watch: list[dict] = field(default_factory=list)
+    confidence_note: str | None = None
     unverified_starters: list[str] = field(default_factory=list)
     booster_advice: list[str] = field(default_factory=list)
     schedule: list[str] = field(default_factory=list)
@@ -189,22 +190,51 @@ def _squad_rows(
             "price": round(float(r["price"]), 1),
             "ep_match": round(float(r["ep_match"]), 2),
             "p_play": round(play, 4),
+            "ep_basis": str(r["ep_basis"]) if "ep_basis" in r else "",
+            "ep_confidence": str(r["ep_confidence"]) if "ep_confidence" in r else "",
             "role": role,
         })
     return out
 
 
+_CONFIDENCE_MARK = {"high": "high", "medium": "med", "low": "LOW"}
+
+
 def _squad_table(rows: list[dict]) -> Table:
     table = Table(title="Recommended squad")
-    for col in ("Pos", "Player", "Team", "Price", "EP/match", "Play%", "Role"):
+    for col in ("Pos", "Player", "Team", "Price", "EP/match", "Play%", "Conf", "Role"):
         table.add_column(col)
     for r in rows:
+        conf = _CONFIDENCE_MARK.get(r.get("ep_confidence", ""), r.get("ep_confidence", ""))
         table.add_row(
             r["position"], r["name"], r["team"],
             f"${r['price']:.1f}m", f"{r['ep_match']:.2f}",
-            f"{r['p_play'] * 100:.0f}%", r["role"],
+            f"{r['p_play'] * 100:.0f}%", conf, r["role"],
         )
     return table
+
+
+def _confidence_note(rows: list[dict]) -> str | None:
+    """One-line summary of how much this round's EPs lean on approximations.
+
+    Counts the squad by confidence tier and names the low-confidence players
+    (price prior only / scant data), so the user knows which numbers are soft.
+    None when the basis is not available (e.g. synthetic pools without the
+    column)."""
+    levels = [r.get("ep_confidence") for r in rows if r.get("ep_confidence")]
+    if not levels:
+        return None
+    counts = {tier: levels.count(tier) for tier in ("high", "medium", "low")}
+    low_names = [r["name"] for r in rows if r.get("ep_confidence") == "low"]
+    note = (
+        f"EP confidence: {counts['high']} high / {counts['medium']} medium / "
+        f"{counts['low']} low"
+    )
+    if low_names:
+        note += (
+            f" — low = price-prior-only / scant WC data: {', '.join(low_names)}"
+        )
+    return note
 
 
 def _unverified_starter_lines(df, solution: SquadSolution) -> list[str]:
@@ -379,6 +409,7 @@ def compute_advice(
     emit("Refreshing FIFA feeds...")
     changed = fifa_client.refresh()
     player_points.apply_calibration()
+    tunables.apply_calibration()
     feeds_changed = [k for k, v in changed.items() if v]
     emit(f"Feeds updated: {feeds_changed or 'none (cache hit)'}")
 
@@ -640,6 +671,7 @@ def compute_advice(
         transfers=transfers_info,
         moves=moves,
         availability_watch=availability_watch,
+        confidence_note=_confidence_note(squad_rows),
         unverified_starters=unverified,
         booster_advice=booster,
         schedule=schedule,
@@ -687,6 +719,8 @@ def _print_advice(plan: AdvicePlan) -> None:
 
     console.print(_squad_table(plan.squad_rows))
     console.print(f"\nTotal cost: ${plan.cost:.1f}m (${plan.bank:.1f}m left)")
+    if plan.confidence_note:
+        console.print(plan.confidence_note)
 
     if plan.availability_watch:
         console.print("\n[bold]Availability watch (P(plays) below 75%):[/bold]")

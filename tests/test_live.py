@@ -398,3 +398,51 @@ def test_live_proactive_nothing_to_do_without_kickoffs(squad_df, team):
         squad_df, team, phases, points={}, change_cost=0.0, kickoffs=None
     )
     assert any("nothing to do" in line for line in lines)
+
+
+# ------------------------------------ option-value roll after the captain played
+
+def test_live_completed_captain_rolls_from_earlier_option(squad_df, team):
+    # Captain (id 11) has finished with a poor 2 pts. Among the still-to-play
+    # starters, p9 (3.9 EP) kicks off EARLIER than the higher-EP anchor p10
+    # (4.0 EP): captain p9 first and roll the armband to p10 if he flops, rather
+    # than a plain switch straight to p10.
+    phases = {i: "scheduled" for i in range(1, 16)}
+    phases[11] = "completed"
+    points = {11: 2.0}
+    kickoffs = {
+        9: datetime.fromisoformat("2026-06-20T18:00:00+00:00"),
+        10: datetime.fromisoformat("2026-06-21T18:00:00+00:00"),
+    }
+    lines = live.captain_advice(
+        squad_df, team, phases, points, change_cost=0.0, kickoffs=kickoffs
+    )
+    assert any("MOVE the armband to p9" in line for line in lines)
+    assert any("roll it live" in line for line in lines)
+
+
+def test_live_completed_captain_keeps_when_banked_beats_the_field(squad_df, team):
+    # Same earlier/later setup, but the captain hauled 12: no still-to-play
+    # option (rolled or not) beats the banked points, so KEEP wins.
+    phases = {i: "scheduled" for i in range(1, 16)}
+    phases[11] = "completed"
+    points = {11: 12.0}
+    kickoffs = {
+        9: datetime.fromisoformat("2026-06-20T18:00:00+00:00"),
+        10: datetime.fromisoformat("2026-06-21T18:00:00+00:00"),
+    }
+    lines = live.captain_advice(
+        squad_df, team, phases, points, change_cost=0.0, kickoffs=kickoffs
+    )
+    assert any(line.startswith("KEEP") for line in lines)
+
+
+def test_live_completed_captain_plain_switch_without_kickoffs(squad_df, team):
+    # No kickoff times: nothing to roll on, so the completed-captain branch is
+    # the plain highest-EP switch (the pre-existing behaviour, unchanged).
+    phases = {i: "scheduled" for i in range(1, 16)}
+    phases[11] = "completed"
+    points = {11: 2.0}
+    lines = live.captain_advice(squad_df, team, phases, points, change_cost=0.0)
+    assert any(line.startswith("SWITCH") for line in lines)
+    assert not any("roll" in line.lower() for line in lines)

@@ -27,10 +27,11 @@ from difflib import get_close_matches
 
 from rich.console import Console
 
-from . import feed_status, features, fifa_client, fixtures, rules, state
+from . import feed_status, features, fifa_client, fixtures, rules, state, tunables
 from .data_sources import availability as availability_mod
-from .models import player_points
+from .models import player_points, progression
 from .optimizer import captain as captain_mod
+from .tunables import DNP_PROB
 
 console = Console()
 
@@ -63,10 +64,9 @@ class LiveState:
     def to_dict(self) -> dict:
         return asdict(self)
 
-# Rough chance that a starter whose match is still to play ends up with
-# no minutes (late knock, surprise rotation). Used only to price the
-# auto-sub insurance forfeited by the first manual change.
-DNP_PROB = 0.06
+# DNP_PROB (rough chance a still-to-play starter gets no minutes, used only to
+# price the auto-sub insurance the first manual change forfeits) is imported
+# from tunables.py.
 
 
 def _rome_tz():
@@ -279,6 +279,100 @@ def _initial_captain_lines(
     return [f"Captain {cap['name']} has not played yet: nothing to do."]
 
 
+def _completed_captain_lines(
+    df,
+    team: state.TeamState,
+    phases: dict[int, str],
+    points: dict[int, float | None],
+    change_cost: float,
+    kickoffs: dict[int, datetime] | None,
+) -> list[str]:
+    """Captain advice once the current captain's match is COMPLETE.
+
+    The double is spent on a known return, so the question is whether to move
+    the armband to a starter still to play. Among those, the SAME option-value
+    plan as the opening pick applies (captain.plan_captain): if a strong option
+    kicks off EARLIER than the highest-EP one, captain him first and roll the
+    armband toward that higher-EP anchor if he disappoints - banking the better
+    of the two. Falls back to a plain highest-EP switch when there is nothing to
+    roll on (no kickoff times, or only one strong option), so the simple
+    SWITCH / KEEP verdicts are unchanged.
+    """
+    by_id = df.set_index("id")
+    cap = by_id.loc[team.captain_id]
+    actual = points.get(team.captain_id)
+    candidates = [
+        (
+            pid,
+            float(by_id.loc[pid, "ep_match"]),
+            (kickoffs or {}).get(int(by_id.loc[pid, "squadId"])),
+        )
+        for pid in team.starters
+        if pid != team.captain_id
+        and pid in by_id.index
+        and phases.get(int(by_id.loc[pid, "squadId"]), "scheduled") == "scheduled"
+    ]
+    if not candidates:
+        return [
+            f"Captain {cap['name']} has finished, but no starter is still "
+            "to play: no switch possible."
+        ]
+
+    plan = captain_mod.plan_captain(candidates)
+    anchor = by_id.loc[plan.anchor]
+    anchor_ep = float(anchor["ep_match"])
+    rolling = plan.initial != plan.anchor and plan.initial in by_id.index
+    initial = by_id.loc[plan.initial] if rolling else anchor
+    deadline = _deadline(kickoffs, int(initial["squadId"]))
+
+    if actual is None:
+        if rolling:
+            return [
+                f"Captain {cap['name']} has finished but his live points are "
+                f"not in the feed yet. Best play: captain {initial['name']} "
+                f"({initial['ep_match']:.1f} EP, your earliest strong option "
+                f"still to play) and roll the armband to {anchor['name']} "
+                f"({anchor_ep:.1f} EP) before his kickoff if he disappoints — "
+                f"worth it only if the captain scored under "
+                f"~{anchor_ep + change_cost:.1f}." + deadline
+            ]
+        return [
+            f"Captain {cap['name']} has finished but his live points are "
+            "not in the feed yet. Rule of thumb: switch to "
+            f"{anchor['name']} (expected {anchor_ep:.1f}) only if the "
+            f"captain scored fewer than ~{anchor_ep + change_cost:.1f} pts."
+            + deadline
+        ]
+
+    gain = anchor_ep - actual - change_cost
+    if gain <= 0:
+        return [
+            f"KEEP captain {cap['name']}: his {actual:.0f} banked pts beat "
+            f"{anchor['name']}'s expected {anchor_ep:.1f}"
+            + (f" once the auto-sub forfeit (~{change_cost:.1f}) is priced in"
+               if change_cost > 0 else "")
+            + "."
+        ]
+    if rolling:
+        return [
+            f"MOVE the armband to {initial['name']} ({initial['squadName']}, "
+            f"{initial['ep_match']:.1f} EP): he is your earliest strong option "
+            f"still to play, so captain him FIRST and roll it live toward "
+            f"{anchor['name']} ({anchor_ep:.1f} EP) if he disappoints (option "
+            f"value ~+{plan.premium:.1f} captain pts over captaining "
+            f"{anchor['name']} outright). Both beat keeping {cap['name']}'s "
+            f"{actual:.0f} banked." + deadline
+        ]
+    msg = (
+        f"SWITCH captain to {anchor['name']} ({anchor['squadName']}): the "
+        f"double moves from {actual:.0f} banked pts to an expected "
+        f"{anchor_ep:.1f} (net gain ~{gain:+.1f}"
+    )
+    if change_cost > 0:
+        msg += f" after pricing the auto-sub forfeit ~{change_cost:.1f}"
+    return [msg + ")." + deadline]
+
+
 def captain_advice(
     df,
     team: state.TeamState,
@@ -301,49 +395,7 @@ def captain_advice(
             "his match to evaluate a switch."
         ]
 
-    actual = points.get(team.captain_id)
-    candidates = by_id.loc[
-        [
-            pid for pid in team.starters
-            if pid != team.captain_id
-            and pid in by_id.index
-            and phases.get(int(by_id.loc[pid, "squadId"]), "scheduled") == "scheduled"
-        ]
-    ]
-    if candidates.empty:
-        return [
-            f"Captain {cap['name']} has finished, but no starter is still "
-            "to play: no switch possible."
-        ]
-    best = candidates.sort_values("ep_match", ascending=False).iloc[0]
-
-    deadline = _deadline(kickoffs, int(best["squadId"]))
-    if actual is None:
-        return [
-            f"Captain {cap['name']} has finished but his live points are "
-            "not in the feed yet. Rule of thumb: switch to "
-            f"{best['name']} (expected {best['ep_match']:.1f}) only if the "
-            f"captain scored fewer than ~{best['ep_match'] + change_cost:.1f} pts."
-            + deadline
-        ]
-
-    gain = float(best["ep_match"]) - actual - change_cost
-    if gain > 0:
-        msg = (
-            f"SWITCH captain to {best['name']} ({best['squadName']}): the "
-            f"double moves from {actual:.0f} banked pts to an expected "
-            f"{best['ep_match']:.1f} (net gain ~{gain:+.1f}"
-        )
-        if change_cost > 0:
-            msg += f" after pricing the auto-sub forfeit ~{change_cost:.1f}"
-        return [msg + ")." + deadline]
-    return [
-        f"KEEP captain {cap['name']}: his {actual:.0f} banked pts beat "
-        f"{best['name']}'s expected {best['ep_match']:.1f}"
-        + (f" once the auto-sub forfeit (~{change_cost:.1f}) is priced in"
-           if change_cost > 0 else "")
-        + "."
-    ]
+    return _completed_captain_lines(df, team, phases, points, change_cost, kickoffs)
 
 
 def substitution_advice(
@@ -719,6 +771,7 @@ def compute_live_state(
     emit("Refreshing FIFA feeds...")
     fifa_client.refresh()
     player_points.apply_calibration()
+    tunables.apply_calibration()
     players_raw = fifa_client.load("players")
     rounds = fifa_client.load("rounds")
     squads = fifa_client.load("squads")
@@ -781,8 +834,20 @@ def compute_live_state(
     # chart (who actually played the completed matches), not the price rank.
     observed = availability_mod.observed_start_factors(rounds, round_no, squads, df)
     club_ep = player_points.club_prior(df)
-    df["ep_match"] = player_points.expected_points_per_match(
+    base_ep = player_points.expected_points_per_match(
         df, club_ep, availability=availability, observed_starts=observed
+    )
+    # Fixture context: apply the SAME opponent difficulty + DEF/MID clean-sheet
+    # tilt as advise, so the live captain/sub EVs weigh who each still-to-play
+    # player faces (a starter against a minnow is worth more than one against a
+    # giant). Run the seeded progression once for fresh Elo ratings; the
+    # adjustment degrades to neutral if the simulation could not produce them
+    # (offline fallback).
+    emit("Estimating fixture difficulty (Elo)...")
+    progression.survival_curve(df, squads, rounds)
+    ratings = progression.last_run_info.get("ratings")
+    df["ep_match"], _ = player_points.fixture_adjusted_ep(
+        df, base_ep, rounds, round_no, ratings
     )
     points = {
         p["id"]: player_round_points(p.get("stats"), round_no) for p in players_raw

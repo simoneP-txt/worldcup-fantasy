@@ -4,11 +4,19 @@ import pytest
 from wcfantasy.data_sources.club_stats import match_name, normalize_name
 from wcfantasy.models.player_points import (
     NAILED_STARTER_CEILING,
+    clean_sheet_adjustment,
+    clean_sheet_probability,
+    ep_basis_and_confidence,
     expected_points_per_match,
+    fixture_adjusted_ep,
     opponent_factor,
     project_club_ep,
     starter_probability,
+    team_clean_sheet,
 )
+
+_CS_ROUNDS = [{"id": 1, "tournaments": [{"homeSquadId": 1, "awaySquadId": 2}]}]
+_CS_RATINGS = {1: 1800.0, 2: 1400.0}  # squad 1 much stronger
 
 
 def _club_row(position: str, **stats) -> dict:
@@ -162,6 +170,75 @@ def test_opponent_factor_neutral_without_ratings():
     players = pd.DataFrame([{"squadId": 1}, {"squadId": 2}])
     rounds = [{"id": 1, "tournaments": [{"homeSquadId": 1, "awaySquadId": 2}]}]
     assert (opponent_factor(players, rounds, 1, ratings=None) == 1.0).all()
+
+
+# --------------------------------------------- opponent-aware clean sheet model
+
+def test_clean_sheet_probability_tilts_around_base():
+    assert clean_sheet_probability(0.5, 0.30, 1.0) == pytest.approx(0.30)  # even
+    assert clean_sheet_probability(1.0, 0.30, 1.0) == pytest.approx(0.60)  # winner
+    assert clean_sheet_probability(0.0, 0.30, 1.0) == pytest.approx(0.0)   # loser
+    assert 0.0 <= clean_sheet_probability(0.9, 0.30, 5.0) <= 1.0           # clipped
+
+
+def test_team_clean_sheet_strong_side_reads_higher_and_concede_one_valid():
+    players = pd.DataFrame([{"squadId": 1, "position": "DEF"},
+                            {"squadId": 2, "position": "DEF"}])
+    p_cs, p_one = team_clean_sheet(players, _CS_ROUNDS, 1, _CS_RATINGS)
+    assert p_cs.iloc[0] > 0.30 > p_cs.iloc[1]            # strong vs weak
+    assert (p_one >= 0).all() and (p_one <= 1).all()
+    # Poisson-consistent: P(1) = -ln(p_cs) * p_cs
+    import numpy as np
+    assert p_one.iloc[0] == pytest.approx(-np.log(p_cs.iloc[0]) * p_cs.iloc[0])
+
+
+def test_team_clean_sheet_flat_without_ratings():
+    players = pd.DataFrame([{"squadId": 1, "position": "DEF"},
+                            {"squadId": 2, "position": "DEF"}])
+    p_cs, _ = team_clean_sheet(players, _CS_ROUNDS, 1, ratings=None)
+    assert (p_cs == 0.30).all()  # no opponent signal -> the flat base rate
+
+
+def test_clean_sheet_adjustment_only_moves_def_mid():
+    players = pd.DataFrame([
+        {"squadId": 1, "position": "DEF"},
+        {"squadId": 1, "position": "MID"},
+        {"squadId": 1, "position": "FWD"},
+        {"squadId": 1, "position": "GK"},
+    ])
+    p_cs = pd.Series([0.50, 0.50, 0.50, 0.50], index=players.index)
+    adj = clean_sheet_adjustment(players, p_cs)
+    assert adj.iloc[0] == pytest.approx((0.50 - 0.30) * 5)  # DEF
+    assert adj.iloc[1] == pytest.approx((0.50 - 0.30) * 1)  # MID
+    assert adj.iloc[2] == 0.0  # FWD (no CS points)
+    assert adj.iloc[3] == 0.0  # GK (prior already uses its own club CS rate)
+
+
+def test_fixture_adjusted_ep_boosts_easy_floors_hard_and_never_resurrects():
+    players = pd.DataFrame([
+        {"squadId": 1, "position": "DEF"},  # strong side, available
+        {"squadId": 2, "position": "DEF"},  # weak side, available
+        {"squadId": 2, "position": "DEF"},  # weak side, ruled out (base 0)
+    ])
+    base = pd.Series([2.0, 2.0, 0.0], index=players.index)
+    ep, _ = fixture_adjusted_ep(players, base, _CS_ROUNDS, 1, _CS_RATINGS)
+    assert ep.iloc[0] > 2.0            # easy fixture + CS tilt lifts it
+    assert ep.iloc[1] == pytest.approx(0.5)  # hard fixture floored, not below
+    assert ep.iloc[2] == 0.0           # unavailable stays 0 (no resurrection)
+
+
+def test_ep_basis_and_confidence_tiers():
+    players = pd.DataFrame([
+        {"matchesPlayed": 5},  # >= full -> observed form (high)
+        {"matchesPlayed": 0},  # no minutes, club-matched -> club proxy (medium)
+        {"matchesPlayed": 0},  # no minutes, no club -> price only (low)
+        {"matchesPlayed": 2},  # half of full, no club -> partial form (medium)
+    ])
+    club_matched = pd.Series([False, True, False, False], index=players.index)
+    basis, level = ep_basis_and_confidence(players, club_matched, full=4.0)
+    assert level.tolist() == ["high", "medium", "low", "medium"]
+    assert basis.iloc[0] == "observed WC form"
+    assert basis.iloc[2] == "price prior only"
 
 
 def test_normalize_name_strips_accents():

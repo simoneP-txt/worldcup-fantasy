@@ -151,6 +151,19 @@ def _simple_probs(diff):
     return p * (1 - draw), draw, (1 - p) * (1 - draw)
 
 
+def test_sample_scoreline_signs_match_outcomes_with_real_margins():
+    import numpy as np
+    rng = np.random.default_rng(0)
+    outcomes = np.array([1, -1, 0] * 200)
+    gh, ga = progression._sample_scoreline(outcomes, 0.5, 0.25, rng)
+    wins, losses, draws = outcomes == 1, outcomes == -1, outcomes == 0
+    assert (gh[wins] > ga[wins]).all()      # a win really has the home edge
+    assert (gh[losses] < ga[losses]).all()  # a loss the away edge
+    assert (gh[draws] == ga[draws]).all()   # a draw is level
+    # decisive games carry a >= 1 margin (no 0-0 "win")
+    assert (np.abs(gh[wins] - ga[wins]) >= 1).all()
+
+
 def test_simulate_respects_bracket_capacity():
     squads, rounds, rating = _synthetic_world()
     curve, champion = progression._simulate(

@@ -37,8 +37,8 @@ import numpy as np
 import pandas as pd
 from rich.console import Console
 
-from . import features, fifa_client
-from .models import player_points
+from . import feed_status, features, fifa_client, tunables
+from .models import elo, player_points
 
 console = Console()
 
@@ -56,6 +56,19 @@ MIN_SAMPLES = 30
 # weight in or out of the proposal.
 CORR_EPS = 0.005
 MAE_EPS = 0.01
+
+# Calibratable TUNABLES (tunables.py). Each has its own sample gate so it stays
+# inert until the data supports it, plus a minimum delta from the default so a
+# near-identical fit does not churn the file. Deliberately strict: early-round
+# samples are thin, so most stay unproposed for the first rounds.
+MIN_GROUP_MATCHES = 16      # completed group matches before the goals mean is trusted
+GROUP_GOALS_EPS = 0.1       # don't rewrite group goals for a sub-0.1 change
+MIN_CV_MATCHES = 3          # matches a player needs before his score CV is usable
+MIN_CV_PLAYERS = 15         # qualifying players before a captain CV is proposed
+CAPTAIN_CALIBER_MEAN = 3.0  # only count players averaging captain-worthy points
+CV_EPS = 0.05               # don't rewrite captain CV for a sub-0.05 change
+MIN_CS_OBS = 60             # team-match clean-sheet observations before fitting the spread
+CS_SPREAD_MIN = 0.05        # a fitted spread below this is treated as "flat"
 
 
 def observed_per_match(df: pd.DataFrame) -> pd.Series:
@@ -159,6 +172,168 @@ def _price_prior_with(df: pd.DataFrame, slope: float, intercept: float) -> pd.Se
     return (intercept + slope * df["price"] + own_w * df["percentSelected"]).clip(lower=0.5)
 
 
+# ----------------------------------------------- tunable (tunables.py) fits
+
+def _completed_matches(rounds, only_rounds=None):
+    """Yield (round id, match) for every completed match carrying a score."""
+    for r in rounds:
+        if only_rounds is not None and r.get("id") not in only_rounds:
+            continue
+        for m in r.get("tournaments", []):
+            if m.get("homeScore") is None or not feed_status.result_usable(m.get("status")):
+                continue
+            yield r.get("id"), m
+
+
+def fit_group_goals(rounds) -> tuple[float, int] | None:
+    """Empirical GROUP_GOALS_PER_MATCH: the mean total goals in a completed
+    group-stage match. None below MIN_GROUP_MATCHES completed games (too few to
+    trust the average over the hand-picked default)."""
+    totals = [
+        int(m["homeScore"]) + int(m["awayScore"])
+        for _, m in _completed_matches(rounds, only_rounds=(1, 2, 3))
+    ]
+    if len(totals) < MIN_GROUP_MATCHES:
+        return None
+    return float(np.mean(totals)), len(totals)
+
+
+def _player_match_points(stats) -> list[float]:
+    """Per-round points a player has scored, from the feed's roundPoints (a dict
+    keyed by round number, with a list fallback)."""
+    rp = (stats or {}).get("roundPoints")
+    if isinstance(rp, dict):
+        return [float(v) for v in rp.values() if isinstance(v, (int, float))]
+    if isinstance(rp, list):
+        return [float(v) for v in rp if isinstance(v, (int, float))]
+    return []
+
+
+def fit_captain_cv(players_raw) -> tuple[float, int] | None:
+    """Empirical CAPTAIN_SCORE_CV: the median coefficient of variation (SD/mean)
+    of per-match points among captain-caliber players - those averaging at least
+    CAPTAIN_CALIBER_MEAN points over at least MIN_CV_MATCHES matches. That is
+    exactly the match-to-match score dispersion the option-value model assumes
+    for the kind of player you would captain. None until MIN_CV_PLAYERS such
+    players have a multi-match history, so it stays inert early on."""
+    cvs = []
+    for p in players_raw:
+        pts = _player_match_points(p.get("stats"))
+        if len(pts) < MIN_CV_MATCHES:
+            continue
+        arr = np.asarray(pts, dtype=float)
+        mean = float(arr.mean())
+        if mean < CAPTAIN_CALIBER_MEAN:
+            continue
+        cvs.append(float(arr.std(ddof=1) / mean))
+    if len(cvs) < MIN_CV_PLAYERS:
+        return None
+    return float(np.median(cvs)), len(cvs)
+
+
+def fit_clean_sheet_spread(rounds, squads, base_rate) -> tuple[float, int] | None:
+    """Empirical CLEAN_SHEET_OPPONENT_SPREAD: how strongly the opponent's Elo
+    bends the clean-sheet rate. Model cs ~ base*(1 + spread*(2E-1)); least
+    squares of the residual (cs - base) on base*(2E-1), where E is the Elo
+    expected score and cs is 1 when the opponent failed to score. Needs the Elo
+    ratings (local match history), so it degrades to None if those are
+    unavailable. Returned ONLY when the fit beats the flat baseline on MAE and is
+    meaningfully non-zero; None below MIN_CS_OBS team-match observations."""
+    try:
+        from .models import progression  # local: heavy Elo / history deps
+        model, id_to_name = progression._build_elo(squads, rounds)
+    except Exception:
+        return None
+    rating = {
+        s["id"]: model.rating(id_to_name[s["id"]])
+        for s in squads
+        if s["id"] in id_to_name
+    }
+
+    xs, ys, observed = [], [], []
+    for _, m in _completed_matches(rounds):
+        h, a = m.get("homeSquadId"), m.get("awaySquadId")
+        if h not in rating or a not in rating:
+            continue
+        hs, as_ = int(m["homeScore"]), int(m["awayScore"])
+        for team, opp, conceded in ((h, a, as_), (a, h, hs)):
+            e = elo.expected_score(rating[team] - rating[opp])
+            cs = 1.0 if conceded == 0 else 0.0
+            xs.append(base_rate * (2.0 * e - 1.0))
+            ys.append(cs - base_rate)
+            observed.append(cs)
+    if len(xs) < MIN_CS_OBS:
+        return None
+    x, y, cs = np.asarray(xs), np.asarray(ys), np.asarray(observed)
+    denom = float((x * x).sum())
+    if denom <= 0:
+        return None
+    spread = max(0.0, min(2.0, float((x * y).sum() / denom)))
+    mae_flat = float(np.abs(base_rate - cs).mean())
+    pred = np.clip(base_rate + spread * x, 0.0, 1.0)
+    mae_fit = float(np.abs(pred - cs).mean())
+    if spread < CS_SPREAD_MIN or mae_fit > mae_flat - MAE_EPS:
+        return None
+    return spread, len(xs)
+
+
+def propose_tunables(
+    rounds, squads, players_raw, base_rate, *, emit
+) -> tuple[dict, dict, list[str]]:
+    """Gated fits for the calibratable tunables (tunables.py). Returns
+    (proposals, diagnostics, rejections): each proposal is accepted only when
+    its estimator clears its sample gate AND differs from the current default by
+    more than a churn epsilon (the clean-sheet spread self-gates on MAE)."""
+    proposals: dict = {}
+    diag: dict = {}
+    rejections: list[str] = []
+
+    gg = fit_group_goals(rounds)
+    if gg is None:
+        emit(f"Group goals/match: need >= {MIN_GROUP_MATCHES} completed group "
+             "matches; skipping.")
+    else:
+        value, n = gg
+        diag["group_goals"] = {"value": round(value, 3), "n": n}
+        emit(f"Group goals/match: {value:.2f} from {n} completed group matches "
+             f"(default {tunables.GROUP_GOALS_PER_MATCH}).")
+        if abs(value - tunables.GROUP_GOALS_PER_MATCH) > GROUP_GOALS_EPS:
+            proposals["group_goals_per_match"] = round(value, 3)
+            emit("  -> accepted.")
+        else:
+            rejections.append(
+                f"group_goals_per_match: within {GROUP_GOALS_EPS} of the default")
+
+    cc = fit_captain_cv(players_raw)
+    if cc is None:
+        emit(f"Captain score CV: need >= {MIN_CV_PLAYERS} players with "
+             f">= {MIN_CV_MATCHES} matches; skipping.")
+    else:
+        value, n = cc
+        diag["captain_cv"] = {"value": round(value, 3), "n": n}
+        emit(f"Captain score CV: {value:.2f} from {n} multi-match players "
+             f"(default {tunables.CAPTAIN_SCORE_CV}).")
+        if abs(value - tunables.CAPTAIN_SCORE_CV) > CV_EPS:
+            proposals["captain_score_cv"] = round(value, 3)
+            emit("  -> accepted.")
+        else:
+            rejections.append(f"captain_score_cv: within {CV_EPS} of the default")
+
+    cs = fit_clean_sheet_spread(rounds, squads, base_rate)
+    if cs is None:
+        emit("Clean-sheet opponent spread: too few clean-sheet observations or "
+             "no improvement over the flat rate; skipping.")
+    else:
+        value, n = cs
+        diag["cs_spread"] = {"value": round(value, 3), "n": n}
+        proposals["clean_sheet_opponent_spread"] = round(value, 3)
+        emit(f"Clean-sheet opponent spread: {value:.2f} from {n} team-matches "
+             f"(beats the flat baseline; default "
+             f"{tunables.CLEAN_SHEET_OPPONENT_SPREAD}).")
+
+    return proposals, diag, rejections
+
+
 def compute_calibration(
     *, write: bool = False, log=None
 ) -> dict:
@@ -194,6 +369,9 @@ def compute_calibration(
         "club_accepted": False,
         "proposed_weights": {},
         "rejections": [],
+        "tunables_diag": {},
+        "proposed_tunables": {},
+        "tunable_rejections": [],
         "written": False,
         "refusal_reason": None,
     }
@@ -268,6 +446,18 @@ def compute_calibration(
     result["proposed_weights"] = weights
     emit(f"Proposed weights: {weights or '(none — defaults already best on corr/mae)'}")
 
+    # --- calibratable tunables (tunables.py): each gated, inert until its data
+    # supports it (so most stay unproposed for the first rounds) -------------
+    rounds = fifa_client.load("rounds")
+    proposed_tunables, tdiag, trej = propose_tunables(
+        rounds, squads, players_raw,
+        player_points.WEIGHTS["flat_clean_sheet_rate"], emit=emit,
+    )
+    result["proposed_tunables"] = proposed_tunables
+    result["tunables_diag"] = tdiag
+    result["tunable_rejections"] = trej
+    emit(f"Proposed tunables: {proposed_tunables or '(none — defaults kept)'}")
+
     if not write:
         emit(
             f"Dry run. Re-run with --write to persist to {CALIBRATION_FILE} "
@@ -284,9 +474,9 @@ def compute_calibration(
             f"only {n_played} observations (need >= {MIN_SAMPLES})"
         )
         return result
-    if not weights:
-        emit("Nothing to write: no candidate beat the defaults on corr/mae.")
-        result["refusal_reason"] = "no candidate beat the defaults on corr/mae"
+    if not weights and not proposed_tunables:
+        emit("Nothing to write: no weight or tunable beat the defaults.")
+        result["refusal_reason"] = "no candidate beat the defaults"
         return result
 
     blob = {
@@ -294,6 +484,7 @@ def compute_calibration(
         "n_samples": n_played,
         "metrics_before": default_price_metrics,
         "weights": weights,
+        "tunables": proposed_tunables,
     }
     CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
     CALIBRATION_FILE.write_text(json.dumps(blob, indent=2), encoding="utf-8")

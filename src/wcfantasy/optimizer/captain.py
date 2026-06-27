@@ -18,8 +18,15 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .. import fixtures, rules
+from .. import fixtures, rules, tunables
 from ..state import TeamState
+from ..tunables import (
+    CAPTAIN_CONTENDER_FLOOR,
+    CAPTAIN_MIN_PREMIUM,
+    CAPTAIN_SCORE_SD_FLOOR,
+    CAPTAIN_SWITCH_COST,
+    LINEUP_OPTION_WEIGHT,
+)
 from .squad import BENCH_WEIGHT, SquadSolution
 
 
@@ -60,7 +67,7 @@ def ordered_bench(df: pd.DataFrame, solution: SquadSolution) -> tuple[list[int],
 # benching a player does not forfeit his future rounds (he starts them when
 # his fixture comes). Using the horizon here wrongly benched in-form players
 # from weaker nations (a shorter expected run dragged their score down).
-LINEUP_OPTION_WEIGHT = 0.10
+# LINEUP_OPTION_WEIGHT: see tunables.py (imported at top).
 
 
 def _reactivity(squad: pd.DataFrame, kickoff: dict[int, object]) -> dict[int, float]:
@@ -161,17 +168,9 @@ def lineup_timing_note(df: pd.DataFrame, swaps: list[tuple[int, int]]) -> str | 
 # rolling the armband to a later, higher-EP one if he disappoints banks the
 # MAX of the early realisation and the later expectation - worth more than
 # captaining the single highest-EP starter outright, even when the early one
-# rates a fair bit lower (the EP estimate is itself noisy). These constants
-# drive that estimate; they are deliberate approximations, calibratable once
-# real WC captain scores accumulate.
-CAPTAIN_SCORE_CV = 0.65         # SD of a captain score as a fraction of its EP
-CAPTAIN_SCORE_SD_FLOOR = 2.0    # min SD so low-EP players still carry spread
-CAPTAIN_SWITCH_COST = 0.7       # pts forfeited by the FIRST live armband move
-                                # (auto-sub + vice insurance), incurred once
-CAPTAIN_CONTENDER_FLOOR = 0.70  # ignore starters below this fraction of the
-                                # top EP as captain candidates (replaces the old
-                                # hard 0.92 gate that rejected the option play)
-CAPTAIN_MIN_PREMIUM = 0.1       # don't churn the armband for a negligible edge
+# rates a fair bit lower (the EP estimate is itself noisy). The constants that
+# drive that estimate (CAPTAIN_SCORE_CV etc.) live in tunables.py, imported
+# above, with their provenance and sensitivity notes.
 
 
 @dataclass
@@ -184,47 +183,79 @@ class CaptainPlan:
     premium: float = 0.0        # doubled option gain over the anchor, net of cost
 
 
-def _norm_pdf(x: float) -> float:
-    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-
-
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
 
 
-def _expected_max(mu: float, sd: float, floor: float) -> float:
-    """E[max(X, floor)] for X ~ N(mu, sd**2) - the normal call-option value."""
-    if sd <= 0:
-        return max(mu, floor)
-    d = (mu - floor) / sd
-    return mu * _norm_cdf(d) + floor * _norm_cdf(-d) + sd * _norm_pdf(d)
+def _effective_cv(mean: float, cv: float, sd_floor: float) -> float:
+    """Coefficient of variation, floored so a low-EP player still carries
+    spread: the absolute SD floor expressed as a CV (sd_floor / mean)."""
+    if mean <= 0:
+        return cv
+    return max(cv, sd_floor / mean)
+
+
+def _expected_max(mean: float, floor: float, *, cv: float, sd_floor: float) -> float:
+    """E[max(X, floor)] for X LOGNORMAL with this mean and effective CV.
+
+    Lognormal, not Normal: a captain haul is a right tail, and the whole point
+    of the live armband roll is to bank that upside - a symmetric Normal
+    understates it. Closed form is the Black-Scholes call written on the mean
+    (forward) F = mean and strike K = floor:
+        E[max(X, K)] = F*Phi(d1) + K*Phi(-d2),
+        d1 = (ln(F/K) + sigma**2/2)/sigma,  d2 = d1 - sigma.
+    Degrades to max(mean, floor) when either is non-positive or sigma -> 0.
+    """
+    if mean <= 0 or floor <= 0:
+        return max(mean, floor)
+    sigma = math.sqrt(math.log(1.0 + _effective_cv(mean, cv, sd_floor) ** 2))
+    if sigma <= 0:
+        return max(mean, floor)
+    d1 = (math.log(mean / floor) + 0.5 * sigma * sigma) / sigma
+    d2 = d1 - sigma
+    return mean * _norm_cdf(d1) + floor * _norm_cdf(-d2)
+
+
+def _prob_below(mean: float, k: float, *, cv: float, sd_floor: float) -> float:
+    """P(X < k) for X LOGNORMAL(mean, effective CV): the chance the earliest
+    captain underperforms the continuation value k, i.e. you roll the armband."""
+    if mean <= 0 or k <= 0:
+        return float(mean < k)
+    sigma = math.sqrt(math.log(1.0 + _effective_cv(mean, cv, sd_floor) ** 2))
+    if sigma <= 0:
+        return float(mean < k)
+    d2 = (math.log(mean / k) - 0.5 * sigma * sigma) / sigma
+    return _norm_cdf(-d2)
 
 
 def sequential_captain_value(
     mus: list[float],
     *,
-    cv: float = CAPTAIN_SCORE_CV,
+    cv: float | None = None,
     sd_floor: float = CAPTAIN_SCORE_SD_FLOOR,
 ) -> float:
     """EV (un-doubled) of optimally captaining players given in KICKOFF order.
 
     Policy: hold the armband on the first, then after each match keep it or
     roll to the next not-yet-played player. Backward recursion
-    V_i = E[max(X_i, V_{i+1})], V_last = mu_last. Monotone: the value of
-    starting earliest is >= captaining any single player outright.
+    V_i = E[max(X_i, V_{i+1})], V_last = mu_last, X_i lognormal. Monotone
+    (E[max(X, K)] >= max(mean, K)): starting earliest is >= captaining any
+    single player outright. `cv` defaults to the calibratable captain-score CV.
     """
     if not mus:
         return 0.0
+    if cv is None:
+        cv = tunables.tuned("captain_score_cv")
     v = mus[-1]
     for mu in reversed(mus[:-1]):
-        v = _expected_max(mu, max(cv * mu, sd_floor), v)
+        v = _expected_max(mu, v, cv=cv, sd_floor=sd_floor)
     return v
 
 
 def plan_captain(
     candidates: list[tuple],
     *,
-    cv: float = CAPTAIN_SCORE_CV,
+    cv: float | None = None,
     sd_floor: float = CAPTAIN_SCORE_SD_FLOOR,
     switch_cost: float = CAPTAIN_SWITCH_COST,
     contender_floor: float = CAPTAIN_CONTENDER_FLOOR,
@@ -236,11 +267,14 @@ def plan_captain(
     strong starter first and rolling the armband to the anchor is worth more:
     the doubled option premium must beat the one-off live-switch cost. A
     `kickoff` of None means the time is unknown - such players cannot anchor a
-    timed roll and only count as the fallback anchor.
+    timed roll and only count as the fallback anchor. `cv` defaults to the
+    calibratable captain-score CV.
     """
     cand = [(int(pid), float(ep), ko) for pid, ep, ko in candidates]
     if not cand:
         return None
+    if cv is None:
+        cv = tunables.tuned("captain_score_cv")
     anchor_id, top_ep, _ = max(cand, key=lambda c: c[1])
     if top_ep <= 0:
         return CaptainPlan(initial=anchor_id, anchor=anchor_id, sequence=[anchor_id])
@@ -259,8 +293,7 @@ def plan_captain(
     mus = [c[1] for c in strong]
     v_seq = sequential_captain_value(mus, cv=cv, sd_floor=sd_floor)
     v_rest = sequential_captain_value(mus[1:], cv=cv, sd_floor=sd_floor)
-    sd0 = max(cv * mus[0], sd_floor)
-    p_roll = _norm_cdf((v_rest - mus[0]) / sd0) if sd0 > 0 else float(mus[0] < v_rest)
+    p_roll = _prob_below(mus[0], v_rest, cv=cv, sd_floor=sd_floor)
     premium = 2.0 * (v_seq - top_ep) - p_roll * switch_cost
     if premium > min_premium:
         return CaptainPlan(
@@ -353,6 +386,51 @@ def _dead_wood(squad: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
+# Display names and the natural window of each booster, for the single-line
+# "in hand" note when nothing is recommended this round.
+_BOOSTER_LABELS = {
+    "qualification": "Qualification Booster",
+    "wildcard": "Wildcard",
+    "clean_sheet_shield": "Clean Sheet Shield",
+    "maximum_captain": "Maximum Captain",
+    "twelfth_man": "12th Man",
+}
+_BOOSTER_HOLD_HINT = {
+    "qualification": "for the semi-final",
+    "wildcard": "for a late-knockout rebuild",
+    "clean_sheet_shield": "for your strongest knockout defensive block",
+    "maximum_captain": "for a high-ceiling round",
+    "twelfth_man": "for a one-off extra scorer",
+}
+
+
+def _clean_sheet_shield_ev(starters: pd.DataFrame) -> dict | None:
+    """EV breakdown of the Clean Sheet Shield for a starting XI, or None when
+    there is no GK/DEF/MID clean-sheet block. Shared by the activation decision
+    and the advice line so the two never disagree. Uses the per-team, Elo-derived
+    P(concede exactly one) when expected_value supplied it, else the flat
+    fallback. {ev, at_stake, n_block, top_team, top_n}."""
+    block = starters[starters["position"].isin(["GK", "DEF", "MID"])].copy()
+    if block.empty:
+        return None
+    cs = block["position"].map(rules.CLEAN_SHEET_POINTS).astype(float)
+    p_play = block["p_play"].fillna(1.0) if "p_play" in block.columns else 1.0
+    at_stake = float((cs * p_play).sum())
+    if "p_concede_one" in block.columns:
+        poc = block["p_concede_one"].fillna(rules.CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB)
+        ev = float((cs * p_play * poc).sum())
+    else:
+        ev = at_stake * rules.CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB
+    by_team = block.groupby("squadName")["id"].count().sort_values(ascending=False)
+    return {
+        "ev": ev,
+        "at_stake": at_stake,
+        "n_block": int(len(block)),
+        "top_team": by_team.index[0],
+        "top_n": int(by_team.iloc[0]),
+    }
+
+
 def planned_activation(
     unused: list[str],
     next_round: int,
@@ -366,7 +444,8 @@ def planned_activation(
     Decided up front so a lower-priority booster (Maximum Captain) can never
     preempt a higher-priority planned one (Qualification at the semi-final):
     that ordering bug is exactly what this guards against. Priority:
-    Qualification at the SF -> a late-KO Wildcard rebuild -> Maximum Captain.
+    Qualification at the SF -> a late-KO Wildcard rebuild -> the Clean Sheet
+    Shield on a strong knockout block -> Maximum Captain.
     """
     if (
         "qualification" in unused
@@ -381,6 +460,10 @@ def planned_activation(
         and len(_dead_wood(squad)) >= 4
     ):
         return "wildcard"
+    if "clean_sheet_shield" in unused and next_round in rules.CLEAN_SHEET_SHIELD_ROUNDS:
+        info = _clean_sheet_shield_ev(starters)
+        if info and info["ev"] >= rules.CLEAN_SHEET_SHIELD_MIN_EV:
+            return "clean_sheet_shield"
     if "maximum_captain" in unused and cap["ep_match"] >= 5.5:
         return "maximum_captain"
     return None
@@ -389,124 +472,106 @@ def planned_activation(
 def booster_advice(
     df: pd.DataFrame, state: TeamState, solution: SquadSolution, next_round: int
 ) -> list[str]:
+    """A SINGLE recommendation for the round: the one booster to use (chosen by
+    strategy priority among those still unused), or that none is worth it. No
+    per-booster wall of HOLD/candidate lines - just the decision, with the key
+    numbers, and one compact 'in hand' line when nothing is recommended.
+    Everything except the Wildcard is reversible before lockout, so a USE is
+    risk-free until the round locks."""
     unused = [b for b in rules.BOOSTERS if b not in state.boosters_used]
     if not unused:
-        return []
+        return ["All boosters already used — none left to play."]
     if next_round == 1:
         return [
-            "No booster in round 1 (your strategy): no data yet, the "
-            "opening round is the most unpredictable of the tournament."
+            "This round: no booster (your strategy — round 1 is the most "
+            "unpredictable of the tournament)."
         ]
 
-    advice = []
     starters = df[df["id"].isin(solution.starter_ids)]
     squad = df[df["id"].isin(solution.squad_ids)]
     cap = df.loc[df["id"] == solution.captain_id].iloc[0]
-
-    # Never two boosters in the same round: pick the one to ACTIVATE up
-    # front by strategy priority; everyone else gets HOLD/info messaging.
-    # Everything except the Wildcard can be deactivated before lockout, so
-    # an ACTIVATE here is risk-free until the round locks.
     planned = planned_activation(unused, next_round, cap, starters, squad)
 
-    if "maximum_captain" in unused:
-        if planned == "maximum_captain":
-            advice.append(
-                f"ACTIVATE Maximum Captain: high-ceiling round ({cap['name']} "
-                f"expected {cap['ep_match']:.1f} pts) and the booster captains "
-                "your best XI scorer in hindsight, never worse than picking one."
-            )
-        elif cap["ep_match"] >= 5.5:
-            advice.append(
-                f"Maximum Captain candidate ({cap['name']} expected "
-                f"{cap['ep_match']:.1f} pts), but a higher-priority booster is "
-                "planned this round."
-            )
+    if planned == "qualification":
+        n = _progressing_starters(starters, next_round)
+        return [
+            f"This round: USE the Qualification Booster — your semi-final window: "
+            f"{n}/11 starters favoured to progress, +2 each (1+ minute; the "
+            "captain's +2 is not doubled)."
+        ]
+    if planned == "wildcard":
+        dead = len(_dead_wood(squad))
+        return [
+            f"This round: USE the Wildcard — {dead} squad players are out; rebuild "
+            "around the teams still alive. Irreversible once confirmed."
+        ]
+    if planned == "clean_sheet_shield":
+        info = _clean_sheet_shield_ev(starters)
+        return [
+            f"This round: USE the Clean Sheet Shield — {info['n_block']} clean-sheet "
+            f"starters (~{info['at_stake']:.0f} pts at stake, ~+{info['ev']:.1f} EV "
+            f"if a team concedes exactly one), led by {info['top_team']} "
+            f"({info['top_n']}). One-shot knockout booster."
+        ]
+    if planned == "maximum_captain":
+        return [
+            f"This round: USE Maximum Captain — high-ceiling round ({cap['name']} "
+            f"~{cap['ep_match']:.1f} pts); it captains your best XI scorer in "
+            "hindsight, never worse than picking one yourself."
+        ]
 
-    if "qualification" in unused and next_round in rules.QUALIFICATION_BOOSTER_ROUNDS:
-        # +2 per starter (>=1 minute played) whose team progresses; the
-        # captain's +2 is not doubled.
-        progressing = _progressing_starters(starters, next_round)
-        msg = (
-            f"Qualification Booster: {progressing}/11 starters favoured to "
-            "progress (+2 each, needs 1+ minute; captain's +2 not doubled)."
-        )
-        if planned == "qualification":
-            # User strategy: fire it at the SF, when the 6-per-country cap
-            # lets the squad stack a likely finalist.
-            advice.append(
-                "ACTIVATE " + msg + " Semi-final is your planned window: "
-                "starters from a finalist bank the bonus twice (SF + final win)."
-            )
-        elif next_round < 7:
-            advice.append(
-                "HOLD Qualification Booster (your plan: semi-finals). " + msg
-            )
-        else:
-            advice.append("Consider " + msg)
+    # Nothing worth activating: one concise line naming what is still in hand
+    # and its window, instead of a HOLD line per booster. The Clean Sheet Shield
+    # carries its current EV and the bar, so you can see how close it came and
+    # tune CLEAN_SHEET_SHIELD_MIN_EV from real rounds.
+    held = ", ".join(
+        _booster_hold_note(b, next_round, starters)
+        for b in unused
+        if b in _BOOSTER_LABELS
+    )
+    return [
+        f"This round: no booster worth it — keep what you have. In hand: {held}."
+        if held
+        else "This round: no booster worth it."
+    ]
 
-    if "wildcard" in unused:
-        if next_round in rules.WILDCARD_EXCLUDED_ROUNDS:
-            advice.append(
-                "Wildcard not allowed this round (banned for matchday 1 "
-                "and the R32; the R32 window is unlimited anyway)."
-            )
-        elif next_round >= 5:
-            dead = _dead_wood(squad)
-            if planned == "wildcard":
-                advice.append(
-                    f"ACTIVATE Wildcard (your plan): {len(dead)} squad players "
-                    "are eliminated or done; rebuild around the teams still "
-                    "alive. Careful: irreversible once confirmed."
-                )
-            elif len(dead) >= 4:
-                advice.append(
-                    f"Wildcard candidate round: {len(dead)} squad players "
-                    "eliminated, but another booster is already advised."
-                )
-            else:
-                advice.append(
-                    f"HOLD Wildcard: only {len(dead)} squad players eliminated; "
-                    "wait until the dead wood justifies a full rebuild."
-                )
-    if "twelfth_man" in unused and next_round >= 4:
-        pick = twelfth_man_pick(df, solution)
-        advice.append(
-            f"12th Man candidate: {pick['name']} ({pick['squadName']}, "
-            f"{pick['ep_match']:.1f} EP) - no budget or country limits, "
-            "pick is locked for the round once it starts."
-        )
-    if "clean_sheet_shield" in unused and next_round in rules.CLEAN_SHEET_SHIELD_ROUNDS:
-        advice.append(clean_sheet_shield_advice(df, solution))
 
-    return advice or ["No booster this round: no standout opportunity."]
+def _booster_hold_note(booster: str, next_round: int, starters: pd.DataFrame) -> str:
+    """'<Name> (<window>)' for the in-hand line, with the Clean Sheet Shield's
+    live EV and the activation bar appended at a KO round, so the number you
+    would calibrate against is visible even when the shield is held."""
+    label, hint = _BOOSTER_LABELS[booster], _BOOSTER_HOLD_HINT[booster]
+    if booster == "clean_sheet_shield" and next_round in rules.CLEAN_SHEET_SHIELD_ROUNDS:
+        info = _clean_sheet_shield_ev(starters)
+        if info:
+            return (
+                f"{label} (~+{info['ev']:.1f} EV this round, bar "
+                f"{rules.CLEAN_SHEET_SHIELD_MIN_EV:.0f} — {hint})"
+            )
+    return f"{label} ({hint})"
 
 
 def clean_sheet_shield_advice(df: pd.DataFrame, solution: SquadSolution) -> str:
-    """Assess the Clean Sheet Shield for the round: it keeps the clean-sheet
-    bonus of your GK/DEF/MID until a SECOND goal, so its value is the points
-    those starters would otherwise lose to a single goal, weighted by P(the
-    team concedes exactly one). Recommend it for the KO round with the biggest,
-    most concentrated defensive block (correlated clean sheets pay together)."""
-    starters = df[df["id"].isin(solution.starter_ids)]
-    block = starters[starters["position"].isin(["GK", "DEF", "MID"])].copy()
-    if block.empty:
-        return "HOLD Clean Sheet Shield: no clean-sheet starters this round."
-    cs = block["position"].map(rules.CLEAN_SHEET_POINTS).astype(float)
-    p_play = block["p_play"].fillna(1.0) if "p_play" in block.columns else 1.0
-    at_stake = float((cs * p_play).sum())
-    ev = at_stake * rules.CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB
-    by_team = block.groupby("squadName")["id"].count().sort_values(ascending=False)
-    top_team, top_n = by_team.index[0], int(by_team.iloc[0])
+    """Detailed Clean Sheet Shield assessment for one round (a single string).
 
-    if ev >= rules.CLEAN_SHEET_SHIELD_MIN_EV:
+    The shield keeps the clean-sheet bonus of your GK/DEF/MID until a SECOND
+    goal, so its value is the points those starters would otherwise lose to a
+    single goal, weighted by P(the team concedes exactly one). Recommend it for
+    the KO round with the biggest, most concentrated defensive block (correlated
+    clean sheets pay together). booster_advice gives the one-line verdict; this
+    is the breakdown behind it."""
+    starters = df[df["id"].isin(solution.starter_ids)]
+    info = _clean_sheet_shield_ev(starters)
+    if info is None:
+        return "HOLD Clean Sheet Shield: no clean-sheet starters this round."
+    if info["ev"] >= rules.CLEAN_SHEET_SHIELD_MIN_EV:
         return (
-            f"Clean Sheet Shield candidate: {len(block)} clean-sheet starters "
-            f"(~{at_stake:.0f} pts at stake, ~+{ev:.1f} EV if a team concedes "
-            f"exactly one), led by {top_team} ({top_n}). Use it in the KO round "
-            "with your strongest, most favoured defensive block."
+            f"Clean Sheet Shield candidate: {info['n_block']} clean-sheet starters "
+            f"(~{info['at_stake']:.0f} pts at stake, ~+{info['ev']:.1f} EV if a team "
+            f"concedes exactly one), led by {info['top_team']} ({info['top_n']}). Use "
+            "it in the KO round with your strongest, most favoured defensive block."
         )
     return (
-        f"HOLD Clean Sheet Shield: only ~+{ev:.1f} EV this round; save it for a "
-        "KO round where you start more defenders from a favoured side."
+        f"HOLD Clean Sheet Shield: only ~+{info['ev']:.1f} EV this round; save it for "
+        "a KO round where you start more defenders from a favoured side."
     )

@@ -6,6 +6,13 @@ on 2026-06-10), plus the in-game onboarding and FAQ. Rounds are numbered
 Items marked TODO(verify) still need an in-app check at matchday 1.
 """
 
+# Tuning judgements (not game rules) live in tunables.py; re-exported here so
+# rules.* keeps resolving for the booster advice that reads them.
+from .tunables import (  # noqa: F401, E402
+    CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB,
+    CLEAN_SHEET_SHIELD_MIN_EV,
+)
+
 BUDGET = 100.0  # $m, group stage
 # Applied automatically once round 3 locks and R32 transfers open.
 KNOCKOUT_BUDGET_BONUS = 5.0  # $m
@@ -128,12 +135,9 @@ QUALIFICATION_MIN_MINUTES = 1
 CLEAN_SHEET_SHIELD_ROUNDS = (4, 5, 6, 7, 8)
 CLEAN_SHEET_SHIELD_AVAILABLE_FROM_ROUND = 4
 CLEAN_SHEET_SHIELD_GOALS_ALLOWED = 1
-# Rough P(a team concedes EXACTLY one goal) in a knockout tie - the scenario
-# the shield converts into a clean sheet. Calibratable once KO results accrue.
-CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB = 0.30
-# Minimum one-round EV (clean-sheet pts saved x that probability) worth a
-# "candidate" call rather than holding the shield for a stronger round.
-CLEAN_SHEET_SHIELD_MIN_EV = 2.5
+# CLEAN_SHEET_SHIELD_CONCEDE_ONE_PROB (P a team concedes exactly one goal) and
+# CLEAN_SHEET_SHIELD_MIN_EV (the EV bar to advise the shield) are tuning
+# judgements, imported from tunables.py above.
 
 # Old booster keys mapped onto a renamed one, so a recorded/typed legacy
 # name still resolves after the Mystery reveal.

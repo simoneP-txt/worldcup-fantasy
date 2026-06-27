@@ -34,8 +34,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .. import feed_status
+from .. import feed_status, tunables
 from ..data_sources import economics, intl_results, odds
+from ..tunables import ODDS_NUDGE_GAIN, ODDS_NUDGE_MAX  # noqa: F401 - re-exported
 from . import elo
 
 log = logging.getLogger(__name__)
@@ -50,10 +51,8 @@ _BRACKET_FILE = Path(__file__).resolve().parents[1] / "data" / "bracket_2026.jso
 
 N_SIMS = 2000
 
-# Outright-odds calibration: Elo nudge = GAIN * ln(p_market / p_simulated),
-# clamped. Kept moderate so the market corrects, not replaces, the model.
-ODDS_NUDGE_GAIN = 60.0
-ODDS_NUDGE_MAX = 80.0
+# ODDS_NUDGE_GAIN / ODDS_NUDGE_MAX (the outright-odds Elo nudge) are tuning
+# judgements, imported from tunables.py above.
 
 # Filled by survival_curve on each run; advise reports it to the user.
 last_run_info: dict = {}
@@ -128,6 +127,29 @@ def _build_elo(squads: list[dict], rounds: list[dict]) -> tuple[elo.EloModel, di
                 neutral=fifa_names[home_id] not in HOST_NAMES,
             )
     return model, id_to_name
+
+
+def _sample_scoreline(outcomes, p_win: float, p_draw: float, rng) -> tuple:
+    """Goals (home, away) consistent with each already-sampled outcome.
+
+    Pure-ish (rng-driven), vectorised. Two independent Poissons whose means
+    split GROUP_GOALS_PER_MATCH by the expected score E = p_win + p_draw/2,
+    then the SIGN is pinned to the sampled outcome: the calibrated win/draw/loss
+    stays authoritative and only the MARGIN is textured. A decisive game is
+    forced to a >=1 margin, a draw to an equal score. Used solely for the group
+    GD / goals-for tiebreaks, never to decide who won.
+    """
+    n = len(outcomes)
+    expected = p_win + 0.5 * p_draw
+    total = tunables.tuned("group_goals_per_match")
+    hg = rng.poisson(total * expected, n)
+    ag = rng.poisson(total * (1.0 - expected), n)
+    hi = np.maximum(hg, ag)
+    lo = np.minimum(hg, ag)
+    decided = np.where(hi == lo, hi + 1, hi)  # a win/loss needs a real margin
+    gf_home = np.select([outcomes == 1, outcomes == -1], [decided, lo], default=lo)
+    gf_away = np.select([outcomes == 1, outcomes == -1], [lo, decided], default=lo)
+    return gf_home.astype(np.int16), gf_away.astype(np.int16)
 
 
 def _group_fixtures(rounds: list[dict]) -> list[dict]:
@@ -275,17 +297,25 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
     # Pre-sample group fixture outcomes for all sims at once.
     # outcome per sim: +1 home win, 0 draw, -1 away win.
     fixtures = _group_fixtures(rounds)
-    fixture_outcomes = np.empty((len(fixtures), n_sims), dtype=np.int8)
+    n_fx = len(fixtures)
+    fixture_outcomes = np.empty((n_fx, n_sims), dtype=np.int8)
+    # Scoreline texture per fixture, for the GD / goals-for group tiebreaks (the
+    # OUTCOME stays the calibrated one; completed matches carry their real goals).
+    fixture_gf_home = np.zeros((n_fx, n_sims), dtype=np.int16)
+    fixture_gf_away = np.zeros((n_fx, n_sims), dtype=np.int16)
     for f_idx, m in enumerate(fixtures):
         h, a = m["homeSquadId"], m["awaySquadId"]
         if m.get("homeScore") is not None and feed_status.result_usable(m.get("status")):
             hs, as_ = int(m["homeScore"]), int(m["awayScore"])
-            out = 1 if hs > as_ else -1 if hs < as_ else 0
-            fixture_outcomes[f_idx, :] = out
+            fixture_outcomes[f_idx, :] = 1 if hs > as_ else -1 if hs < as_ else 0
+            fixture_gf_home[f_idx, :] = hs
+            fixture_gf_away[f_idx, :] = as_
         else:
             pw, pd_, pl = match_probs(h, a)
-            fixture_outcomes[f_idx] = rng.choice(
-                [1, 0, -1], size=n_sims, p=[pw, pd_, pl]
+            outs = rng.choice([1, 0, -1], size=n_sims, p=[pw, pd_, pl])
+            fixture_outcomes[f_idx] = outs
+            fixture_gf_home[f_idx], fixture_gf_away[f_idx] = _sample_scoreline(
+                outs, pw, pd_, rng
             )
 
     # Real KO pairings/results from the feed override simulated ones.
@@ -320,9 +350,13 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
     for sim in range(n_sims):
         # group standings
         points = dict.fromkeys(squad_ids, 0)
+        goal_diff = dict.fromkeys(squad_ids, 0)
+        goals_for = dict.fromkeys(squad_ids, 0)
         for f_idx, m in enumerate(fixtures):
             out = fixture_outcomes[f_idx, sim]
             h, a = m["homeSquadId"], m["awaySquadId"]
+            hg = int(fixture_gf_home[f_idx, sim])
+            ag = int(fixture_gf_away[f_idx, sim])
             if out == 1:
                 points[h] += 3
             elif out == -1:
@@ -330,11 +364,19 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
             else:
                 points[h] += 1
                 points[a] += 1
+            goal_diff[h] += hg - ag
+            goal_diff[a] += ag - hg
+            goals_for[h] += hg
+            goals_for[a] += ag
 
-        # rank within groups; goal-difference tiebreaks approximated by
-        # Elo plus noise (the feed has no simulated goal counts)
+        # FIFA group ranking: points, then goal difference, then goals scored.
+        # The Elo + tiny noise final term stands in for head-to-head and the
+        # drawing of lots, used only when those three are still level.
         def rank_key(sid):
-            return points[sid] + (rating[sid] + rng.gumbel(0, 30)) / 1e5
+            return (
+                points[sid], goal_diff[sid], goals_for[sid],
+                rating[sid] + rng.gumbel(0, 30) / 1e3,
+            )
 
         placed: dict[str, list[int]] = {
             g: sorted(members, key=rank_key, reverse=True)

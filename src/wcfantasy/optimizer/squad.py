@@ -17,23 +17,18 @@ import pandas as pd
 import pulp
 
 from .. import rules
-
-BENCH_WEIGHT = 0.15
-# The BACKUP GK is worth far less than an outfield bench player: you start
-# exactly one keeper, and a GK can only be auto-subbed by the other GK, so
-# the second keeper scores only when your #1 plays zero minutes and no manual
-# change is made that round (rare for a nailed starter, ~P(DNP)). Weighting
-# him like an outfield sub made the ILP burn budget on a strong, expensive
-# backup; a near-zero weight makes it take the cheapest viable bench GK and
-# spend the saving on the starting XI.
-BENCH_GK_WEIGHT = 0.03
-# Tiebreak only: among ~worthless backup keepers, prefer the cheapest so the
-# budget is freed for the XI instead of parked on a 5m bench GK who never
-# plays. Tiny enough not to override any real bench-value gap (see _bench_value).
-BENCH_GK_PRICE_TIEBREAK = 0.005
-# Next round dominates; future rounds matter through ep_horizon at a
-# discount so the optimizer still grabs likely-finalist players early.
-HORIZON_WEIGHT = 0.35
+# Tuning weights live in one audited place (tunables.py) with provenance and
+# sensitivity notes; re-exported here so squad.* references and the
+# test monkeypatch points keep working. BENCH_GK_WEIGHT being far below
+# BENCH_WEIGHT is what stops the ILP overpaying for a strong backup keeper;
+# the price tiebreak frees the budget for the XI; HORIZON_WEIGHT discounts
+# future rounds so likely-finalist players are still grabbed early.
+from ..tunables import (  # noqa: F401 - re-exported for callers/tests
+    BENCH_GK_PRICE_TIEBREAK,
+    BENCH_GK_WEIGHT,
+    BENCH_WEIGHT,
+    HORIZON_WEIGHT,
+)
 
 _DEF_MIN, _DEF_MAX = min(f[0] for f in rules.FORMATIONS), max(f[0] for f in rules.FORMATIONS)
 _MID_MIN, _MID_MAX = min(f[1] for f in rules.FORMATIONS), max(f[1] for f in rules.FORMATIONS)

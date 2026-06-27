@@ -6,7 +6,7 @@ import json
 import pandas as pd
 import pytest
 
-from wcfantasy import calibrate
+from wcfantasy import calibrate, tunables
 from wcfantasy.models import player_points
 
 
@@ -99,3 +99,88 @@ def test_apply_calibration_survives_a_corrupt_file(tmp_path, monkeypatch):
     monkeypatch.setattr(player_points, "CALIBRATION_FILE", cal_file)
     player_points.apply_calibration()  # must not raise
     assert player_points.WEIGHTS == player_points._WEIGHT_DEFAULTS
+
+
+# ------------------------------------------------ calibratable tunable fits
+
+def test_fit_group_goals_averages_completed_group_matches():
+    sparse = [{"id": 1, "tournaments": [
+        {"homeScore": 2, "awayScore": 1, "status": "complete"},
+        {"homeScore": 0, "awayScore": 0, "status": "scheduled"},  # no score: skip
+    ]}]
+    assert calibrate.fit_group_goals(sparse) is None  # below MIN_GROUP_MATCHES
+
+    rounds = [
+        {"id": 1, "tournaments": [
+            {"homeScore": 1, "awayScore": 1, "status": "complete"} for _ in range(20)
+        ]},
+        {"id": 4, "tournaments": [  # a KO blow-out, must be ignored
+            {"homeScore": 6, "awayScore": 0, "status": "complete"}
+        ]},
+    ]
+    value, n = calibrate.fit_group_goals(rounds)
+    assert n == 20 and value == pytest.approx(2.0)
+
+
+def test_fit_captain_cv_uses_multimatch_caliber_players():
+    caliber = {"stats": {"roundPoints": {"1": 6, "2": 2, "3": 4}}}  # mean 4, cv 0.5
+    assert calibrate.fit_captain_cv([caliber]) is None  # below the player gate
+    value, n = calibrate.fit_captain_cv([caliber] * 20)
+    assert n == 20 and value == pytest.approx(0.5)
+    low = {"stats": {"roundPoints": {"1": 1, "2": 0, "3": 1}}}  # mean < caliber
+    assert calibrate.fit_captain_cv([low] * 20) is None
+
+
+def test_fit_clean_sheet_spread_positive_when_favourites_keep_sheets(monkeypatch):
+    from wcfantasy.models import progression
+
+    class _Model:
+        def rating(self, name):
+            return 2000.0 if name == "Strong" else 1400.0
+
+    monkeypatch.setattr(
+        progression, "_build_elo",
+        lambda squads, rounds: (_Model(), {1: "Strong", 2: "Weak"}),
+    )
+    squads = [{"id": 1, "name": "Strong"}, {"id": 2, "name": "Weak"}]
+    rounds = [{"id": 1, "tournaments": [
+        {"homeSquadId": 1, "awaySquadId": 2, "homeScore": 2, "awayScore": 0,
+         "status": "complete"} for _ in range(40)
+    ]}]
+    out = calibrate.fit_clean_sheet_spread(rounds, squads, base_rate=0.30)
+    assert out is not None
+    spread, n = out
+    assert spread > 0 and n == 80  # two team-observations per match
+
+
+def test_tunables_apply_calibration_and_consumer_pickup(tmp_path, monkeypatch):
+    cal = tmp_path / "calibration.json"
+    monkeypatch.setattr(tunables, "CALIBRATION_FILE", cal)
+
+    tunables.apply_calibration()  # no file -> defaults
+    assert tunables.tuned("clean_sheet_opponent_spread") == (
+        tunables.CLEAN_SHEET_OPPONENT_SPREAD
+    )
+
+    cal.write_text(json.dumps(
+        {"tunables": {"clean_sheet_opponent_spread": 0.0, "bogus": 9}}
+    ))
+    tunables.apply_calibration()
+    assert tunables.tuned("clean_sheet_opponent_spread") == 0.0
+    assert "bogus" not in tunables.TUNED
+
+    # the consumer reads the live value: spread 0 -> the CS prob is flat (the
+    # base rate) whatever the Elo gap, proving calibration reaches the model.
+    players = pd.DataFrame([{"squadId": 1, "position": "DEF"},
+                            {"squadId": 2, "position": "DEF"}])
+    rounds = [{"id": 1, "tournaments": [{"homeSquadId": 1, "awaySquadId": 2}]}]
+    p_cs, _ = player_points.team_clean_sheet(players, rounds, 1, {1: 1800.0, 2: 1400.0})
+    assert (p_cs == player_points.WEIGHTS["flat_clean_sheet_rate"]).all()
+
+
+def test_tunables_apply_calibration_survives_a_corrupt_file(tmp_path, monkeypatch):
+    cal = tmp_path / "calibration.json"
+    cal.write_text("{ not json")
+    monkeypatch.setattr(tunables, "CALIBRATION_FILE", cal)
+    tunables.apply_calibration()  # must not raise
+    assert tunables.TUNED == tunables._CALIBRATABLE_DEFAULTS

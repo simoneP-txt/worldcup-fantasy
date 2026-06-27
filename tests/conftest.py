@@ -12,6 +12,7 @@ module-global dicts; clear them around every test so one run's diagnostics
 
 import pytest
 
+from wcfantasy import tunables
 from wcfantasy.data_sources import availability
 from wcfantasy.models import player_points, progression
 
@@ -21,9 +22,12 @@ _RUN_INFO_MODULES = (player_points, progression, availability)
 @pytest.fixture(autouse=True)
 def _reset_model_weights():
     saved = dict(player_points.WEIGHTS)
+    saved_tuned = dict(tunables.TUNED)
     yield
     player_points.WEIGHTS.clear()
     player_points.WEIGHTS.update(saved)
+    tunables.TUNED.clear()
+    tunables.TUNED.update(saved_tuned)
 
 
 @pytest.fixture(autouse=True)
