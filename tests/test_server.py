@@ -114,6 +114,25 @@ def test_calibrate_passes_write_flag(client, monkeypatch):
     assert snap["status"] == "done" and seen["write"] is True
 
 
+def test_bracket_job_uses_service(client, monkeypatch):
+    def fake_bracket(log):
+        log("simulating bracket")
+        return {
+            "available": True, "model": "test-model",
+            "rounds": [{"stage": "R32", "name": "Round of 32", "round": 4, "ties": []}],
+            "champion": [{"team": "Argentina", "squadId": 1, "p": 0.2}],
+            "winner": {"team": "Argentina", "p": 0.2},
+        }
+    monkeypatch.setattr(service, "predicted_bracket", fake_bracket)
+    job_id = client.get("/api/bracket").json()["job_id"]
+    snap = _poll(client, job_id)
+    assert snap["status"] == "done"
+    result = snap["result"]
+    assert result["available"] is True
+    assert {"rounds", "champion", "winner", "model"} <= result.keys()
+    assert any("bracket" in line for line in snap["logs"])
+
+
 def test_unknown_job_is_404(client):
     assert client.get("/api/jobs/nope").status_code == 404
 

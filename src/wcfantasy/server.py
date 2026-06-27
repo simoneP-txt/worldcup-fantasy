@@ -104,6 +104,10 @@ def create_app() -> FastAPI:
     def get_odds() -> dict:
         return {"job_id": jobs.start(service.odds_table, kind="odds")}
 
+    @app.get("/api/bracket")
+    def get_bracket() -> dict:
+        return {"job_id": jobs.start(service.predicted_bracket, kind="bracket")}
+
     @app.post("/api/fetch")
     def post_fetch() -> dict:
         return {"job_id": jobs.start(service.fetch_feeds, kind="fetch")}

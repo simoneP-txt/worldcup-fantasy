@@ -317,3 +317,32 @@ def test_fetch_feeds(monkeypatch):
     monkeypatch.setattr(fifa_client, "refresh", lambda force=False: {"players": True, "rounds": False})
     out = service.fetch_feeds()
     assert out["feeds"] == {"players": "updated", "rounds": "unchanged"}
+
+
+def test_predicted_bracket_offline(monkeypatch):
+    players, squads, rounds = make_feeds()
+    install_feeds(monkeypatch, players, squads, rounds)
+    monkeypatch.setattr(fifa_client, "refresh", lambda force=False: {})
+    monkeypatch.setattr(
+        progression, "predicted_bracket",
+        lambda squads, rounds, *a, **k: {
+            "available": True, "model": "test-model",
+            "rounds": [{"stage": "R32", "name": "Round of 32", "round": 4, "ties": []}],
+            "champion": [{"team": "Team1", "squadId": 1, "p": 0.2}],
+            "winner": {"team": "Team1", "p": 0.2},
+        },
+    )
+    out = service.predicted_bracket()
+    assert out["available"] is True
+    assert {"rounds", "champion", "winner", "model"} <= out.keys()
+    json.dumps(out)  # JSON-serializable for the web API
+
+
+def test_predicted_bracket_unavailable_offline(monkeypatch):
+    players, squads, rounds = make_feeds()
+    install_feeds(monkeypatch, players, squads, rounds)
+    monkeypatch.setattr(fifa_client, "refresh", lambda force=False: {})
+    monkeypatch.setattr(progression, "predicted_bracket", lambda *a, **k: {})
+    out = service.predicted_bracket()
+    assert out["available"] is False and out["message"]
+    assert out["rounds"] == [] and out["champion"] == [] and out["winner"] is None

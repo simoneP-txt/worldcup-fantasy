@@ -161,6 +161,14 @@ def odds_table(*, log: Callable[[str], None] | None = None) -> dict:
     return advise.compute_odds(log=log)
 
 
+def predicted_bracket(*, log: Callable[[str], None] | None = None) -> dict:
+    """Predicted knockout bracket (refreshes feeds + runs the Monte Carlo).
+
+    Same single simulation as advise/odds; firms up automatically as completed
+    matches pin their ties on each run."""
+    return advise.compute_bracket(log=log)
+
+
 def live_state(*, log: Callable[[str], None] | None = None) -> dict:
     """Intra-round advice (refreshes feeds). Read-only: records nothing; use
     `record_live` to log a change you actually made in-game."""

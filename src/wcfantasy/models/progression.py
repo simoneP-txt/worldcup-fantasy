@@ -44,6 +44,11 @@ log = logging.getLogger(__name__)
 GROUP_ROUNDS = (1, 2, 3)
 KO_ROUNDS = (4, 5, 6, 7, 8)  # R32, R16, QF, SF, F
 _KO_STAGE_NAMES = {4: "R32", 5: "R16", 6: "QF", 7: "SF", 8: "F"}
+_STAGE_ROUND = {stage: rnd for rnd, stage in _KO_STAGE_NAMES.items()}
+_STAGE_DISPLAY = {
+    "R32": "Round of 32", "R16": "Round of 16", "QF": "Quarter-finals",
+    "SF": "Semi-finals", "F": "Final",
+}
 
 HOST_NAMES = {"USA", "Mexico", "Canada"}
 
@@ -207,6 +212,21 @@ def survival_curve(
 
 
 def _simulate_with_market(squads, rounds, n_sims, seed):
+    """Survival curve from the market-calibrated Monte Carlo (P(reach r))."""
+    curve, _champion, _ctx = _run_market_sim(squads, rounds, n_sims, seed)
+    return curve
+
+
+def _run_market_sim(squads, rounds, n_sims, seed):
+    """Single market-calibrated Monte Carlo run.
+
+    Returns (curve, champion, ctx) where `ctx` carries the match-probability
+    machinery (final ratings, host map, outcome fn, bookmaker h2h) so callers
+    that need per-fixture probabilities - the predicted bracket - can reuse the
+    SAME run instead of simulating twice. `_simulate_with_market` is the thin
+    curve-only wrapper kept for the existing callers (and the tests that patch
+    it).
+    """
     model, id_to_name = _build_elo(squads, rounds)
     probs_fn = _outcome_prob_fn(model)
 
@@ -241,9 +261,16 @@ def _simulate_with_market(squads, rounds, n_sims, seed):
         curve, champion = _simulate(squads, rounds, nudged, probs_fn, h2h, n_sims, seed)
         last_run_info["model"] = "Elo + economics + market calibration"
         last_run_info["ratings"] = nudged
+        rating = nudged
     # P(wins the tournament) per squadId, for the `odds` command.
     last_run_info["champion"] = champion
-    return curve
+    ctx = {
+        "rating": rating,
+        "fifa_names": {s["id"]: s["name"] for s in squads},
+        "probs_fn": probs_fn,
+        "h2h": h2h,
+    }
+    return curve, champion, ctx
 
 
 def nudge_ratings(
@@ -267,6 +294,44 @@ def nudge_ratings(
     return nudged
 
 
+def _match_probs(h, a, rating, fifa_names, probs_fn, h2h):
+    """(p_home, p_draw, p_away): bookmaker h2h if quoted, else Elo + host edge.
+
+    Shared by the simulation loop and the predicted-bracket display so the two
+    never disagree on a fixture's probabilities. Pure and unit-tested.
+    """
+    if h2h:
+        if (h, a) in h2h:
+            return h2h[(h, a)]
+        if (a, h) in h2h:
+            pl, pd_, pw = h2h[(a, h)]
+            return pw, pd_, pl
+    diff = rating[h] - rating[a]
+    if fifa_names[h] in HOST_NAMES:
+        diff += elo.HOME_ADVANTAGE
+    elif fifa_names[a] in HOST_NAMES:
+        diff -= elo.HOME_ADVANTAGE
+    return probs_fn(diff)
+
+
+def _advance_probs(h, a, rating, fifa_names, probs_fn, h2h):
+    """(P(home advances), P(away advances)) for one KO tie, summing to 1.
+
+    The 90' draw is collapsed into extra time exactly as `ko_winner` does: the
+    home team takes it with its Elo expected score on the RAW rating diff (no
+    host edge in the shootout coin). Pure and unit-tested.
+    """
+    pw, pd_, _pl = _match_probs(h, a, rating, fifa_names, probs_fn, h2h)
+    et = elo.expected_score(rating[h] - rating[a])
+    p_home = pw + pd_ * et
+    return p_home, 1.0 - p_home
+
+
+def _modal(counter: dict):
+    """Most-frequent key in an occupancy counter (argmax), or None if empty."""
+    return max(counter, key=counter.get) if counter else None
+
+
 def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
     bracket = json.loads(_BRACKET_FILE.read_text(encoding="utf-8"))
     template = bracket["template"]
@@ -281,18 +346,7 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
 
     def match_probs(h, a):
         """(p_home, p_draw, p_away): bookmaker if quoted, else Elo."""
-        if h2h:
-            if (h, a) in h2h:
-                return h2h[(h, a)]
-            if (a, h) in h2h:
-                pl, pd_, pw = h2h[(a, h)]
-                return pw, pd_, pl
-        diff = rating[h] - rating[a]
-        if fifa_names[h] in HOST_NAMES:
-            diff += elo.HOME_ADVANTAGE
-        elif fifa_names[a] in HOST_NAMES:
-            diff -= elo.HOME_ADVANTAGE
-        return probs_fn(diff)
+        return _match_probs(h, a, rating, fifa_names, probs_fn, h2h)
 
     # Pre-sample group fixture outcomes for all sims at once.
     # outcome per sim: +1 home win, 0 draw, -1 away win.
@@ -327,6 +381,13 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
 
     reach_counts = {sid: dict.fromkeys(KO_ROUNDS, 0) for sid in squad_ids}
     champion_counts = dict.fromkeys(squad_ids, 0)
+    # Who fills each bracket slot's home/away side, per stage, across all sims:
+    # occupancy[stage][idx] = [home_counter, away_counter]. The modal occupants
+    # become the displayed pairing in `predicted_bracket`.
+    occupancy = {
+        stage: [[{}, {}] for _ in template[stage]]
+        for stage in _KO_STAGE_NAMES.values()
+    }
 
     def ko_winner(h, a):
         pw, pd_, pl = match_probs(h, a)
@@ -421,10 +482,14 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
             actual_by_pair = {
                 (m["homeSquadId"], m["awaySquadId"]): m for m in actual
             }
+            stage_occ = occupancy[stage]
             winners = []
-            for h, a in pairs:
+            for idx, (h, a) in enumerate(pairs):
                 reach_counts[h][round_no] += 1
                 reach_counts[a][round_no] += 1
+                home_occ, away_occ = stage_occ[idx]
+                home_occ[h] = home_occ.get(h, 0) + 1
+                away_occ[a] = away_occ.get(a, 0) + 1
                 winners.append(resolve_pair(h, a, actual_by_pair))
             prev_winners = winners
         champion_counts[prev_winners[0]] += 1
@@ -439,6 +504,9 @@ def _simulate(squads, rounds, rating, probs_fn, h2h, n_sims, seed):
         rows[sid] = probs
     curve = pd.DataFrame.from_dict(rows, orient="index").rename_axis("squadId")
     champion = {sid: c / n_sims for sid, c in champion_counts.items()}
+    # Stash the per-slot occupancy so `predicted_bracket` can read the modal
+    # pairing without a second Monte Carlo (overwritten by the calibrated pass).
+    last_run_info["bracket"] = {"occupancy": occupancy, "n_sims": n_sims}
     return curve, champion
 
 
@@ -492,3 +560,165 @@ def championship_probabilities(
         log.exception("championship simulation failed")
         return {}
     return dict(last_run_info.get("champion", {}))
+
+
+# ---------------------------------------------------------- predicted bracket
+
+def _ko_winner_from_result(m: dict) -> int:
+    """Winning squadId of a COMPLETED KO feed match (penalties break a draw)."""
+    mh, ma = m["homeSquadId"], m["awaySquadId"]
+    hs, as_ = int(m["homeScore"]), int(m["awayScore"])
+    if hs != as_:
+        return mh if hs > as_ else ma
+    hp = m.get("homePenaltyScore") or 0
+    ap = m.get("awayPenaltyScore") or 0
+    return mh if hp >= ap else ma
+
+
+def _assemble_bracket(
+    template, rounds, squads, occupancy, curve, champion, advance_fn, model_label
+) -> dict:
+    """Build the structured bracket schema from one finished simulation.
+
+    Pure (no network, no sim): given the per-slot `occupancy` counters, the
+    survival `curve`, the `champion` map and an `advance_fn(h, a) -> (p_home,
+    p_away)`, it renders each tie. A slot whose modal pairing matches a feed KO
+    match shows the ACTUAL teams (completed -> 100/0 + the real result;
+    scheduled -> model head-to-head); otherwise the modal occupants with the
+    model pass-through. Unit-tested with synthetic counters.
+    """
+    names = {s["id"]: s["name"] for s in squads}
+
+    def p_reach(sid, round_no):
+        if sid is None or sid not in curve.index or round_no not in curve.columns:
+            return None
+        return round(float(curve.loc[sid, round_no]), 4)
+
+    def side(sid, round_no, p_advance, locked):
+        return {
+            "team": names.get(sid),
+            "squadId": int(sid) if sid is not None else None,
+            "p_reach": p_reach(sid, round_no),
+            "p_advance": round(float(p_advance), 4),
+            "locked": bool(locked),
+        }
+
+    rounds_out = []
+    for stage in ("R32", "R16", "QF", "SF", "F"):
+        round_no = _STAGE_ROUND[stage]
+        actual = [
+            m
+            for r in rounds if r["id"] == round_no
+            for m in r.get("tournaments", []) if m.get("homeSquadId")
+        ]
+        actual_by_pair: dict = {}
+        for m in actual:
+            actual_by_pair[(m["homeSquadId"], m["awaySquadId"])] = m
+            actual_by_pair[(m["awaySquadId"], m["homeSquadId"])] = m
+        stage_occ = occupancy.get(stage, [])
+
+        ties = []
+        for idx in range(len(template[stage])):
+            home_occ, away_occ = stage_occ[idx] if idx < len(stage_occ) else ({}, {})
+            mh, ma = _modal(home_occ), _modal(away_occ)
+            feed_match = actual_by_pair.get((mh, ma)) if (mh and ma) else None
+
+            result = None
+            if feed_match is not None:
+                home_id, away_id = feed_match["homeSquadId"], feed_match["awaySquadId"]
+                completed = (
+                    feed_match.get("homeScore") is not None
+                    and feed_status.result_usable(feed_match.get("status"))
+                )
+                if completed:
+                    winner = _ko_winner_from_result(feed_match)
+                    ph = 1.0 if winner == home_id else 0.0
+                    home = side(home_id, round_no, ph, True)
+                    away = side(away_id, round_no, 1.0 - ph, True)
+                    result = {
+                        "homeScore": int(feed_match["homeScore"]),
+                        "awayScore": int(feed_match["awayScore"]),
+                    }
+                    status = "completed"
+                else:
+                    ph, pa = advance_fn(home_id, away_id)
+                    home = side(home_id, round_no, ph, False)
+                    away = side(away_id, round_no, pa, False)
+                    status = "scheduled"
+            elif mh is not None and ma is not None:
+                ph, pa = advance_fn(mh, ma)
+                home = side(mh, round_no, ph, False)
+                away = side(ma, round_no, pa, False)
+                status = "predicted"
+            else:  # degenerate: a slot no simulation ever filled
+                home = side(mh, round_no, 0.0, False)
+                away = side(ma, round_no, 0.0, False)
+                status = "predicted"
+
+            ties.append({
+                "slot": idx + 1,
+                "status": status,
+                "home": home,
+                "away": away,
+                "result": result,
+            })
+        rounds_out.append({
+            "stage": stage,
+            "name": _STAGE_DISPLAY[stage],
+            "round": round_no,
+            "ties": ties,
+        })
+
+    champ_rows = sorted(
+        (
+            {"team": names.get(sid, str(sid)), "squadId": int(sid), "p": round(float(p), 5)}
+            for sid, p in champion.items() if p > 0
+        ),
+        key=lambda row: row["p"],
+        reverse=True,
+    )
+    winner = {"team": champ_rows[0]["team"], "p": champ_rows[0]["p"]} if champ_rows else None
+    return {
+        "available": True,
+        "model": model_label,
+        "rounds": rounds_out,
+        "champion": champ_rows,
+        "winner": winner,
+    }
+
+
+def predicted_bracket(
+    squads: list[dict],
+    rounds: list[dict],
+    n_sims: int = N_SIMS,
+    seed: int | None = 42,
+) -> dict:
+    """Full predicted knockout bracket (R32 -> Final) from one Monte Carlo.
+
+    Reuses the SAME market-calibrated run as `advise`/`odds` (no second sim):
+    each bracket slot shows its modal occupant, completed feed ties pin the real
+    teams + result, and the under-tie pass-through % is the Elo/market
+    head-to-head with the 90' draw collapsed into extra time. Returns {} if the
+    simulation cannot run (e.g. offline), so the caller degrades cleanly like
+    `championship_probabilities`.
+    """
+    try:
+        curve, champion, ctx = _run_market_sim(squads, rounds, n_sims, seed)
+    except Exception:
+        if os.environ.get("WCFANTASY_STRICT"):
+            raise
+        log.exception("predicted bracket simulation failed")
+        return {}
+
+    occupancy = last_run_info.get("bracket", {}).get("occupancy", {})
+    template = json.loads(_BRACKET_FILE.read_text(encoding="utf-8"))["template"]
+
+    def advance_fn(h, a):
+        return _advance_probs(
+            h, a, ctx["rating"], ctx["fifa_names"], ctx["probs_fn"], ctx["h2h"]
+        )
+
+    return _assemble_bracket(
+        template, rounds, squads, occupancy, curve, champion, advance_fn,
+        last_run_info.get("model", "?"),
+    )

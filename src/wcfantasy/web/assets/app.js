@@ -646,6 +646,116 @@ async function renderOdds() {
   host.append(el("div", { class: "card" }, [el("div", { class: "actions" }, [btn])]), results);
 }
 
+// ----------------------------------------------------------------- bracket
+// A short "crest" stand-in: the first 3 letters of the team name, upper-cased.
+function bkCrest(name) {
+  return el("span", { class: "bk-crest", text: (name || "—").slice(0, 3).toUpperCase() });
+}
+
+// One bracket tie: two team rows + an under-match split. The advancing side is
+// highlighted; a completed tie shows the real score and is visually locked.
+function bracketTie(tie) {
+  const { home, away, status, result } = tie;
+  const completed = status === "completed";
+  const homeWins = (home.p_advance ?? 0) >= (away.p_advance ?? 0);
+
+  const teamRow = (sideObj, isHome, isWinner) => {
+    const pct = Math.round((sideObj.p_advance ?? 0) * 100);
+    const val = completed && result
+      ? String(isHome ? result.homeScore : result.awayScore)
+      : `${pct}%`;
+    return el("div", { class: `bk-team${isWinner ? " win" : ""}` }, [
+      bkCrest(sideObj.team),
+      el("span", { class: "bk-name", text: sideObj.team || "—", title: sideObj.team || "" }),
+      el("span", { class: "bk-val", text: val }),
+    ]);
+  };
+
+  const homePct = Math.round((home.p_advance ?? 0) * 100);
+  const under = completed
+    ? el("div", { class: "bk-tag", text: t("bracket.completed") })
+    : el("div", { class: `bk-split${status === "scheduled" ? " scheduled" : ""}`, title: `${homePct}% — ${100 - homePct}%` }, [
+        el("span", { class: "bk-split-h", style: `width:${homePct}%` }),
+        el("span", { class: "bk-split-a", style: `width:${100 - homePct}%` }),
+      ]);
+
+  return el("div", { class: `bk-tie ${status}` }, [
+    teamRow(home, true, homeWins),
+    teamRow(away, false, !homeWins),
+    under,
+  ]);
+}
+
+function championBanner(res) {
+  const w = res.winner;
+  return el("div", { class: "champion-banner" }, [
+    el("span", { class: "trophy", text: "🏆" }),
+    el("div", { class: "champ-body" }, [
+      el("div", { class: "champ-kicker", text: t("bracket.champion") }),
+      el("div", { class: "champ-name", text: w ? w.team : "—" }),
+      w ? el("div", { class: "champ-p", text: `${(w.p * 100).toFixed(1)}%` }) : null,
+    ]),
+  ]);
+}
+
+function contendersCard(res) {
+  const rows = (res.champion || []).slice(0, 6);
+  if (!rows.length) return null;
+  const max = rows[0].p || 1;
+  return el("div", { class: "card" }, [
+    el("h3", {}, [el("span", { class: "badge-ic timing sm", text: "★" }), t("bracket.contenders")]),
+    el("div", { class: "contender-list" }, rows.map((r) =>
+      el("div", { class: "contender-row" }, [
+        el("span", { class: "ct-name", text: r.team }),
+        el("span", { class: "ct-bar" }, [el("span", { style: `width:${Math.round((r.p / max) * 100)}%` })]),
+        el("span", { class: "ct-pct", text: `${(r.p * 100).toFixed(1)}%` }),
+      ])
+    )),
+  ]);
+}
+
+function bracketResultNode(res) {
+  const frag = document.createDocumentFragment();
+  frag.append(championBanner(res));
+
+  const board = el("div", { class: "bracket-board" },
+    (res.rounds || []).map((rnd) =>
+      el("div", { class: "bracket-col" }, [
+        el("div", { class: "bracket-col-head", text: stageLabel(rnd.round) }),
+        el("div", { class: "bracket-col-ties" }, rnd.ties.map(bracketTie)),
+      ])
+    )
+  );
+  frag.append(el("div", { class: "card bracket-card" }, [
+    el("h3", {}, [t("bracket.title"), " ", el("span", { class: "muted", text: `· ${t("odds.model")}: ${res.model}` })]),
+    el("div", { class: "bracket-scroll" }, [board]),
+  ]));
+
+  const contenders = contendersCard(res);
+  if (contenders) frag.append(contenders);
+  return frag;
+}
+
+async function renderBracket() {
+  const host = view();
+  host.replaceChildren(pageHead("bracket.title", "bracket.intro"));
+  const results = el("div", {});
+  const btn = el("button", { class: "btn", text: t("bracket.run") });
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    btn.textContent = t("bracket.refresh");
+    runJobView(results, () => apiGet("/api/bracket"), (res, h) => {
+      btn.disabled = false;
+      if (!res.available) {
+        h.append(el("div", { class: "card" }, [el("div", { class: "callout danger", text: res.message || t("bracket.unavailable") })]));
+        return;
+      }
+      h.append(bracketResultNode(res));
+    }).finally(() => (btn.disabled = false));
+  });
+  host.append(el("div", { class: "card" }, [el("div", { class: "actions" }, [btn])]), results);
+}
+
 async function renderBoosters() {
   const host = view();
   host.replaceChildren(pageHead("boosters.title", "boosters.intro"));
@@ -799,6 +909,7 @@ const TABS = [
   ["ideal", renderIdeal],
   ["live", renderLive],
   ["odds", renderOdds],
+  ["bracket", renderBracket],
   ["boosters", renderBoosters],
   ["calibrate", renderCalibrate],
   ["settings", renderSettings],

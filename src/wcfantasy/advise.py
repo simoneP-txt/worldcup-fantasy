@@ -1020,3 +1020,75 @@ def show_odds() -> None:
         console.print(
             "\n(Market column off: set ODDS_API_KEY for the bookmaker comparison.)"
         )
+
+
+def compute_bracket(*, log: Callable[[str], None] | None = None) -> dict:
+    """Predicted knockout bracket (R32 -> Final) as structured data.
+
+    Runs the same Monte Carlo as `advise` (no second simulation): each tie shows
+    its modal pairing with the model pass-through %, completed feed ties pin the
+    real teams + result, and the champion banner ranks P(win). Refreshes the
+    feeds first so the bracket reflects the last played match. `log` receives
+    progress lines; mirrors `compute_odds`, including the unavailable branch.
+    """
+    emit = log or (lambda _msg: None)
+
+    emit("Refreshing FIFA feeds...")
+    fifa_client.refresh()
+    rounds = fifa_client.load("rounds")
+    squads = fifa_client.load("squads")
+    emit(fifa_client.freshness_report(rounds))
+
+    bracket = progression.predicted_bracket(squads, rounds)
+    if not bracket:
+        return {
+            "available": False,
+            "message": (
+                "Predicted bracket unavailable: the Monte Carlo model could not "
+                "run (check the historical-results download / network)."
+            ),
+            "model": progression.last_run_info.get("model", "?"),
+            "rounds": [],
+            "champion": [],
+            "winner": None,
+        }
+    emit(f"Model: {bracket['model']}")
+    return bracket
+
+
+def _format_tie(tie: dict) -> str:
+    """One readable tie line: 'Team A 80% — 20% Team B' (or the score)."""
+    home, away = tie["home"], tie["away"]
+    hn = home["team"] or "?"
+    an = away["team"] or "?"
+    if tie["status"] == "completed" and tie["result"]:
+        r = tie["result"]
+        winner = " (W)"
+        hw = winner if home["p_advance"] >= away["p_advance"] else ""
+        aw = winner if away["p_advance"] > home["p_advance"] else ""
+        return f"{hn}{hw} {r['homeScore']}-{r['awayScore']} {an}{aw}"
+    return (
+        f"{hn} {home['p_advance'] * 100:.0f}% — "
+        f"{away['p_advance'] * 100:.0f}% {an}"
+    )
+
+
+def show_bracket() -> None:
+    """CLI wrapper over compute_bracket (prints the text bracket)."""
+    result = compute_bracket(log=console.print)
+    if not result["available"]:
+        console.print(result["message"])
+        return
+    console.print(f"\nModel: {result['model']}")
+    for rnd in result["rounds"]:
+        console.print(f"\n[bold]{rnd['name']}[/bold]")
+        for tie in rnd["ties"]:
+            mark = {"completed": "✓", "scheduled": "·", "predicted": " "}.get(
+                tie["status"], " "
+            )
+            console.print(f"  {mark} {_format_tie(tie)}")
+    if result["winner"]:
+        w = result["winner"]
+        console.print(
+            f"\n[bold]Predicted winner:[/bold] {w['team']} ({w['p'] * 100:.1f}%)"
+        )
